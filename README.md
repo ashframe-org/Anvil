@@ -2,7 +2,7 @@
 
 Custom server modification specifically for hosting and running the **Ashframe** community server.
 
-This branch targets Cubyz **0.4.0** download or clone upstream Cubyz separately, then copy these files over the matching paths and build as normal (`zig build`).
+This branch targets Cubyz **0.4.0** (built on current [PixelGuys/Cubyz](https://github.com/PixelGuys/Cubyz) master). It contains only the files that differ from a clean 0.4.0 checkout — download or clone upstream Cubyz separately, then copy these files over the matching paths and build as normal (`zig build`).
 
 ---
 
@@ -25,7 +25,7 @@ This branch targets Cubyz **0.4.0** download or clone upstream Cubyz separately,
 | `/afk` | Toggles your status to away-from-keyboard and notifies the chat. Also triggers automatically after 5 minutes idle. |
 | `/players` | Displays a list of all currently connected online players. |
 | `/kill @<playerIndex>` or `/kill <name>` | Kills the specified player (self, by index, or by smart name match). |
-| `/help` | Displays a personalized list of commands showing only what you have permission to use. |
+| `/help` | Lists commands you have permission to use, split into "Default" (Cubyz) and "Custom" (Ashframe) sections. |
 
 ---
 
@@ -46,3 +46,12 @@ This branch targets Cubyz **0.4.0** download or clone upstream Cubyz separately,
 > **Note:** Admin commands are dynamically filtered out of `/help` and hidden from regular users who lack permission.
 
 ---
+
+## Notes on this port
+
+- `/home` was simplified from the old 3-slot system down to a single home. `/home spawn` (setting your home as your respawn point) was dropped — it never actually hooked into how death/respawn works in current upstream, so it wasn't worth carrying forward broken. Old 3-slot save data still loads correctly.
+- `/spawn` (no arguments) now actually teleports you, instead of just printing coordinates like it did before this port.
+- All command output (success, errors, usage hints, chat prefixes, join/leave messages) uses one consistent Ashframe color palette instead of the old mix of plain red/green/yellow.
+- Chest-locking and other older fork features are intentionally not part of this pass.
+- `/help` now groups commands into "Default" and "Custom" sections; a couple of overly long or awkward built-in command descriptions (`/perm`, `/tickspeed`, `/mask`) were also tightened up for readability.
+- `/spawn` (bare, teleport to spawn) is granted to every player by default. Setting another player's spawn point or moving world spawn (`/spawn @<player> <x> <y> <z>`, `/spawn world ...`) still requires the separate `/command/spawn/admin` permission, same pattern as `/prefix`'s admin gate.

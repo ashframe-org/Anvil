@@ -328,6 +328,10 @@ pub const User = struct { // MARK: User
 			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/prefix");
 			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/tpdeny");
 			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/msg");
+			// Note: "/command/spawn" is granted so players can teleport to spawn, but
+			// spawn.zig gates setting spawn points / moving world spawn behind
+			// "/command/spawn/admin", which is NOT granted by default.
+			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/spawn");
 			// --- ASHFRAME CUSTOM (default command permissions) ---
 		}
 		if (self.isLocal) {

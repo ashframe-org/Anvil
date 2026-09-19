@@ -4,7 +4,7 @@ const main = @import("main");
 const command = main.server.command;
 const Source = command.Source;
 
-pub const description = "Lists all online players and their IDs.";
+pub const description = "List online players.";
 pub const usage = "/players";
 
 pub const Args = union(enum) {

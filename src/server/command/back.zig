@@ -4,7 +4,7 @@ const main = @import("main");
 const command = main.server.command;
 const Source = command.Source;
 
-pub const description = "Teleport back to your last location before death or teleportation.";
+pub const description = "Teleport back to your previous location.";
 pub const usage = "/back";
 
 pub const Args = union(enum) {

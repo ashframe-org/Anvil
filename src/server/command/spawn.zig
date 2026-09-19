@@ -22,9 +22,23 @@ pub const Args = union(enum) {
 	@"/spawn <playerIndex>": struct { playerIndex: ?command.PlayerIndex },
 };
 
+// --- ASHFRAME CUSTOM (Spawn admin gate) ---
+/// /spawn is granted to every player by default so they can teleport to spawn,
+/// but setting another player's spawn point or moving world spawn is an admin
+/// action - gated separately since argparse only has one permission per command.
+fn requireAdmin(source: Source) bool {
+	if (!source.hasPermission("/command/spawn/admin")) {
+		source.sendMessage("#e6312cYou do not have permission to change spawn points.", .{});
+		return false;
+	}
+	return true;
+}
+// --- ASHFRAME CUSTOM (Spawn admin gate) ---
+
 pub fn execute(args: Args, source: Source) void {
 	switch (args) {
 		.@"/spawn <playerIndex> <x> <y> <z>" => |params| {
+			if (!requireAdmin(source)) return;
 			const target = command.Target.fromPlayerIndex(params.playerIndex, source) catch return;
 			target.user.spawnPos = command.resolveCoordinates(params.x, params.y, params.z, source) catch return;
 		},
@@ -38,15 +52,18 @@ pub fn execute(args: Args, source: Source) void {
 			}
 			// --- ASHFRAME CUSTOM (Bare /spawn teleports the caller) ---
 
+			if (!requireAdmin(source)) return;
 			const target = command.Target.fromPlayerIndex(params.playerIndex, source) catch return;
 			source.sendMessage("#ffff00{}", .{target.user.getSpawnPos()});
 		},
 		.@"/spawn <world> <x> <y> <z>" => |params| {
+			if (!requireAdmin(source)) return;
 			const pos = command.resolveCoordinates(params.x, params.y, params.z, source) catch return;
 			const world = main.server.world.?;
 			world.spawn = @trunc(pos);
 		},
 		.@"/spawn <world>" => {
+			if (!requireAdmin(source)) return;
 			const world = main.server.world.?;
 			source.sendMessage("#ffff00World spawn: {}", .{world.spawn});
 		},
