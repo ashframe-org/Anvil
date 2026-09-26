@@ -1,0 +1,18 @@
+.{
+	.tags = .{.mineable},
+	.blockHealth = 120,
+	.blockResistance = 6,
+	.drops = .{
+		.{.items = .{"4 ashframe:core_fragment"}},
+	},
+	.model = "cubyz:cube",
+	.texture = "ashframe:broken_core_side",
+	.texture_front = "ashframe:broken_core_side",
+	.texture_left = "ashframe:broken_core_side",
+	.texture_right = "ashframe:broken_core_side",
+	.texture_top = "ashframe:broken_core_top",
+	.texture_bottom = "cubyz:nimbusite/pillar_bottom",
+	.item = .{
+		.name = "Broken Sky Core",
+	},
+}

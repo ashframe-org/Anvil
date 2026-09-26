@@ -81,13 +81,25 @@ pub fn Parser(comptime T: type, comptime options: Options) type {
 
 			inline for (s.fields) |field| {
 				// --- ASHFRAME CUSTOM (RestOfLine argument type) ---
-				if (field.type == RestOfLine) {
-					const rest = std.mem.trim(u8, args[tokens.index..], " ");
-					if (rest.len == 0) {
-						errorMessage.print("Incorrect usage at <{s}>", .{field.name});
-						return error.ParseError;
+				if (field.type == RestOfLine or field.type == ?RestOfLine) {
+					// nextArgument already holds the first token of the
+					// remainder (consumed by the previous field's trailing
+					// tokens.next(), which moved tokens.index past it), so
+					// the remainder spans from that token's start to the end
+					// of args. Without this the tail alone is always empty and
+					// every trailing-text command (/msg, /prefix add, /ban
+					// reason) fails to parse. Token slices borrow from args,
+					// so this is allocation-free.
+					const rest = std.mem.trim(u8, if (nextArgument) |head| args[@intFromPtr(head.ptr) - @intFromPtr(args.ptr) ..] else args[tokens.index..], " ");
+					if (field.type == ?RestOfLine) {
+						@field(result, field.name) = if (rest.len == 0) null else RestOfLine{.text = rest};
+					} else {
+						if (rest.len == 0) {
+							errorMessage.print("Incorrect usage at <{s}>", .{field.name});
+							return error.ParseError;
+						}
+						@field(result, field.name) = .{.text = rest};
 					}
-					@field(result, field.name) = .{.text = rest};
 					nextArgument = null;
 					continue;
 				}
@@ -155,7 +167,7 @@ pub fn Parser(comptime T: type, comptime options: Options) type {
 					};
 				},
 				inline .int => |intInfo| {
-					return std.fmt.parseInt(std.meta.Int(intInfo.signedness, intInfo.bits), arg, 0) catch {
+					return std.fmt.parseInt(@Int(intInfo.signedness, intInfo.bits), arg, 0) catch {
 						errorMessage.print("Expected an integer for <{s}>, found \"{s}\"", .{name, arg});
 						return error.ParseError;
 					};
@@ -432,3 +444,105 @@ test "subCommands bar" {
 	try std.testing.expectEqual(result.bar.x, 2.0);
 	try std.testing.expectEqual(result.bar.y, 3.0);
 }
+
+// --- ASHFRAME CUSTOM (RestOfLine regression tests) ---
+// `/msg @0 test` used to fail with "Incorrect usage at <message>" because the
+// trailing tokens.next() of the previous field moved tokens.index past the
+// remainder before RestOfLine read it.
+
+test "rest of line single word" {
+	const ArgParser = Parser(struct {
+		target: []const u8,
+		message: RestOfLine,
+	}, .{.commandName = ""});
+
+	var errors: ListManaged(u8) = .init(main.stackAllocator);
+	defer errors.deinit();
+
+	const result = try ArgParser.parse(main.stackAllocator, "@0 test", &errors);
+
+	try std.testing.expectEqualStrings("", errors.items);
+	try std.testing.expectEqualStrings("@0", result.target);
+	try std.testing.expectEqualStrings("test", result.message.text);
+}
+
+test "rest of line multi word" {
+	const ArgParser = Parser(struct {
+		target: []const u8,
+		message: RestOfLine,
+	}, .{.commandName = ""});
+
+	var errors: ListManaged(u8) = .init(main.stackAllocator);
+	defer errors.deinit();
+
+	const result = try ArgParser.parse(main.stackAllocator, "player hello world", &errors);
+
+	try std.testing.expectEqualStrings("", errors.items);
+	try std.testing.expectEqualStrings("player", result.target);
+	try std.testing.expectEqualStrings("hello world", result.message.text);
+}
+
+test "rest of line empty is an error" {
+	const ArgParser = Parser(struct {
+		target: []const u8,
+		message: RestOfLine,
+	}, .{.commandName = ""});
+
+	var errors: ListManaged(u8) = .init(main.stackAllocator);
+	defer errors.deinit();
+
+	const resultOrError = ArgParser.parse(main.stackAllocator, "player", &errors);
+
+	try std.testing.expectError(error.ParseError, resultOrError);
+}
+
+test "optional rest of line absent" {
+	const ArgParser = Parser(struct {
+		target: []const u8,
+		reason: ?RestOfLine,
+	}, .{.commandName = ""});
+
+	var errors: ListManaged(u8) = .init(main.stackAllocator);
+	defer errors.deinit();
+
+	const result = try ArgParser.parse(main.stackAllocator, "playername", &errors);
+
+	try std.testing.expectEqualStrings("", errors.items);
+	try std.testing.expectEqualStrings("playername", result.target);
+	try std.testing.expectEqual(result.reason, null);
+}
+
+test "optional rest of line present" {
+	const ArgParser = Parser(struct {
+		target: []const u8,
+		reason: ?RestOfLine,
+	}, .{.commandName = ""});
+
+	var errors: ListManaged(u8) = .init(main.stackAllocator);
+	defer errors.deinit();
+
+	const result = try ArgParser.parse(main.stackAllocator, "@2 griefing spawn", &errors);
+
+	try std.testing.expectEqualStrings("", errors.items);
+	try std.testing.expectEqualStrings("@2", result.target);
+	try std.testing.expectEqualStrings("griefing spawn", result.reason.?.text);
+}
+
+test "rest of line after rejected optional" {
+	const ArgParser = Parser(struct {
+		cmd: enum { add },
+		index: ?i32,
+		text: RestOfLine,
+	}, .{.commandName = ""});
+
+	var errors: ListManaged(u8) = .init(main.stackAllocator);
+	defer errors.deinit();
+
+	const result = try ArgParser.parse(main.stackAllocator, "add hello world", &errors);
+
+	try std.testing.expectEqualStrings("", errors.items);
+	try std.testing.expectEqual(result.cmd, .add);
+	try std.testing.expectEqual(result.index, null);
+	try std.testing.expectEqualStrings("hello world", result.text.text);
+}
+// --- ASHFRAME CUSTOM (RestOfLine regression tests) ---

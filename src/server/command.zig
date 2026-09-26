@@ -8,6 +8,7 @@ const NeverFailingAllocator = main.heap.NeverFailingAllocator;
 const ListManaged = main.ListManaged;
 const User = main.server.User;
 pub const commandList = @import("command/_list.zig");
+const ashutil = @import("command/ashutil.zig");
 
 pub const Source = union(enum) {
 	user: *User,
@@ -60,7 +61,7 @@ fn initExecutionFn(comptime name: []const u8) *const fn (args: []const u8, sourc
 			var errorMessage: main.ListManaged(u8) = .init(arena);
 			const result = ArgPaser.parse(arena, msg, &errorMessage) catch {
 				const usageBlock = formatUsageBlock(arena, @field(commandList, name).usage);
-				source.sendMessage("#e6312c{s}\n{s}", .{errorMessage.items, usageBlock});
+				source.sendMessage("#e6312cIncorrect use of #cfcfcf/{s}#e6312c: #b0b0b0{s}\n#e6312cHere are the following options:\n{s}", .{name, errorMessage.items, usageBlock});
 				return;
 			};
 			@field(commandList, name).execute(result, source);
@@ -87,6 +88,15 @@ pub fn deinit() void {
 }
 
 pub fn execute(msg: []const u8, source: Source) void {
+	// --- ASHFRAME CUSTOM (Anticheat: command rate limit) ---
+	if (source == .user) {
+		const user = source.user;
+		if (!user.rateCommand.allow(main.server.anticheat.nowMilliseconds())) {
+			main.server.anticheat.note(user, .rate, "command");
+			return;
+		}
+	}
+	// --- ASHFRAME CUSTOM (Anticheat) ---
 	const end = std.mem.indexOfScalar(u8, msg, ' ') orelse msg.len;
 	const command = msg[0..end];
 	if (commands.get(command)) |cmd| {
@@ -96,7 +106,11 @@ pub fn execute(msg: []const u8, source: Source) void {
 		}
 		cmd.exec(msg[@min(end + 1, msg.len)..], source);
 	} else {
-		source.sendMessage("#e6312cUnrecognized Command \"{s}\"", .{command});
+		if (ashutil.suggestCommand(command, source)) |suggestion| {
+			source.sendMessage("#e6312cUnrecognized command \"{s}\". Did you mean #cfcfcf/{s}#e6312c?", .{command, suggestion});
+		} else {
+			source.sendMessage("#e6312cUnrecognized Command \"{s}\"", .{command});
+		}
 	}
 }
 
@@ -147,11 +161,21 @@ pub fn resolveCoordinates(x: Coordinate, y: Coordinate, z: Coordinate, source: S
 		source.sendMessage("Command was run without a user; unable to interpret relative coordinates.", .{});
 		return error.InvalidArg;
 	}
+	const fx = if (x == .relative) source.user.player().pos[0] + x.relative else x.absolute;
+	const fy = if (y == .relative) source.user.player().pos[1] + y.relative else y.absolute;
+	const fz = if (z == .relative) source.user.player().pos[2] + z.relative else z.absolute;
+	// `parseFloat` accepts nan/inf; reject rather than silently clamping to a
+	// boundary. Bounds match the anticheat's own limits (horizontal 1e9,
+	// vertical 1e5) so command coordinates can never exceed what a client may.
+	if (!std.math.isFinite(fx) or !std.math.isFinite(fy) or !std.math.isFinite(fz)) {
+		if (source == .user) source.sendMessage("Invalid coordinates.", .{});
+		return error.InvalidArg;
+	}
 	return .{
 		// TODO: Remove clamp after #310 is implemented
-		std.math.clamp(if (x == .relative) source.user.player().pos[0] + x.relative else x.absolute, -1e9, 1e9),
-		std.math.clamp(if (y == .relative) source.user.player().pos[1] + y.relative else y.absolute, -1e9, 1e9),
-		std.math.clamp(if (z == .relative) source.user.player().pos[2] + z.relative else z.absolute, -1e9, 1e9),
+		std.math.clamp(fx, -main.server.anticheat.maxHorizontal, main.server.anticheat.maxHorizontal),
+		std.math.clamp(fy, -main.server.anticheat.maxHorizontal, main.server.anticheat.maxHorizontal),
+		std.math.clamp(fz, -main.server.anticheat.maxVertical, main.server.anticheat.maxVertical),
 	};
 }
 
@@ -161,10 +185,18 @@ pub fn resolveRotation(yaw: Rotation, pitch: Rotation, source: Source) error{Inv
 		return error.InvalidArg;
 	}
 	const bound = std.math.pi/2.0 - 0.001;
+	const yawValue = if (yaw == .relative) source.user.player().rot[0] + yaw.relative else yaw.absolute;
+	const pitchValue = if (pitch == .relative) source.user.player().rot[2] + pitch.relative else pitch.absolute;
+	if (!std.math.isFinite(yawValue) or !std.math.isFinite(pitchValue)) {
+		if (source == .user) source.sendMessage("Invalid rotation.", .{});
+		return error.InvalidArg;
+	}
 	return .{
-		std.math.clamp(if (yaw == .relative) source.user.player().rot[0] + yaw.relative else yaw.absolute, -bound, bound),
+		std.math.clamp(yawValue, -bound, bound),
 		0,
-		if (pitch == .relative) source.user.player().rot[2] + pitch.relative else pitch.absolute,
+		// Pitch was previously unclamped, so nan/absurd pitch could be sent to
+		// the client; clamp it like yaw.
+		std.math.clamp(pitchValue, -bound, bound),
 	};
 }
 
@@ -188,6 +220,10 @@ pub const Target = struct {
 	}
 };
 
+/// Largest selection volume allowed for WorldEdit operations, so a hostile or
+/// accidental huge selection can't overflow or exhaust memory.
+pub const maxSelectionVolume: u64 = 1 << 18; // 262144 blocks (64^3)
+
 /// Get current selection from user data. This function will output appropriate error to chat upon failure.
 pub fn getCurrentSelection(source: *User) !Blueprint.Selection {
 	const pos1 = source.worldEditData.selectionPosition1 orelse {
@@ -198,7 +234,16 @@ pub fn getCurrentSelection(source: *User) !Blueprint.Selection {
 		source.sendMessage("#e6312cPosition 2 isn't set", .{});
 		return error.SelectionPartiallyUnset;
 	};
-	return .initFromInclusive(pos1, pos2);
+	const selection = Blueprint.Selection.initFromInclusive(pos1, pos2);
+	const volume = selection.volume() orelse {
+		source.sendMessage("#e6312cSelection is too large.", .{});
+		return error.SelectionTooLarge;
+	};
+	if (volume > maxSelectionVolume) {
+		source.sendMessage("#e6312cSelection is too large ({d} blocks, max {d}).", .{ volume, maxSelectionVolume });
+		return error.SelectionTooLarge;
+	}
+	return selection;
 }
 
 pub const PlayerIndex = struct {
@@ -293,5 +338,17 @@ pub const PatternExpression = struct {
 			errorMessage.print("Couldn't parse pattern: {s}", .{@errorName(err)});
 			return error.ParseError;
 		}};
+	}
+};
+
+pub const PermissionPath = struct {
+	path: []const u8,
+
+	pub fn parse(_: NeverFailingAllocator, name: []const u8, arg: []const u8, errorMessage: *ListManaged(u8)) error{ParseError}!PermissionPath {
+		if (arg[0] != '/') {
+			errorMessage.print("Permission path for <{s}> doesn't begin with a \"/\", got: {s}", .{name, arg});
+			return error.ParseError;
+		}
+		return .{.path = arg};
 	}
 };

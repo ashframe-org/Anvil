@@ -164,9 +164,9 @@ pub const ChunkManager = struct { // MARK: ChunkManager
 		}
 		const ch = SimulationChunk.initAndIncreaseRefCount(pos);
 		ch.increaseRefCount();
-		ch.increaseRefCount();
 		simulationChunkHashMap.put(pos, ch) catch unreachable;
 		mutex.unlock();
+		ch.increaseRefCount();
 		ChunkLoadTask.scheduleAndDecreaseRefCount(pos, .{.simulationChunk = ch});
 		return ch;
 	}
@@ -229,14 +229,24 @@ pub const ChunkManager = struct { // MARK: ChunkManager
 
 		pub fn isStillNeeded(self: *ChunkLoadTask) bool {
 			switch (self.source) { // Remove the task if it's far enough away from the player:
-				.player => |player| {
-					const user = server.getUserByIndex(player) orelse return false;
-					const minDistSquare = self.pos.getMinDistanceSquared(user.clientUpdatePos);
-					//                                                                              ↓ Margin for error. (diagonal of 1 chunk)
-					var targetRenderDistance: i64 = @as(i64, user.renderDistance)*chunk.chunkSize + @as(i64, @ceil(@as(comptime_int, chunk.chunkSize)*@sqrt(3.0)));
-					targetRenderDistance *= self.pos.voxelSize;
-					return minDistSquare <= targetRenderDistance*targetRenderDistance;
-				},
+			.player => |player| {
+				const user = server.getUserByIndex(player) orelse return false;
+				// --- ASHFRAME CUSTOM (Dynamic render distance) ---
+				// Keep the task if it is within keep-radius of EITHER the player's
+				// fresh server-side position OR the position the client last asked
+				// from. The server position lags a teleport (it is interpolated from
+				// the client's frames), and the client's request base freezes if the
+				// client stalls. Using only one of them dropped tasks the client was
+				// still waiting for - permanent holes, which the client never retries.
+				// Throttling may delay delivery, never lose it.
+				const keepRadius = user.keepRadiusBlocks(self.pos.voxelSize);
+				const keepRadiusSquare = keepRadius*keepRadius;
+				const liveDistSquare = @as(f64, @floatFromInt(self.pos.getMinDistanceSquared(user.livePosBlock())));
+				if (liveDistSquare <= keepRadiusSquare) return true;
+				const clientDistSquare = @as(f64, @floatFromInt(self.pos.getMinDistanceSquared(user.clientUpdatePos)));
+				return clientDistSquare <= keepRadiusSquare;
+				// --- ASHFRAME CUSTOM (Dynamic render distance) ---
+			},
 				.simulationChunk => |ch| if (ch.refCount.load(.monotonic) == 2) return false,
 			}
 			return true;
@@ -429,8 +439,21 @@ pub const ChunkManager = struct { // MARK: ChunkManager
 
 pub const worldDataVersion: u32 = 5;
 
+// --- ASHFRAME CUSTOM (Anti-xray) ---
+/// Cap on pending ore reveals queued in one tick, bounding the per-tick
+/// neighbour lookups the reveal pass does.
+const maxPendingOreReveal: usize = 1024;
+// --- ASHFRAME CUSTOM (Anti-xray) ---
+
 pub const ServerWorld = struct { // MARK: ServerWorld
 	itemDropManager: ItemDropManager = undefined,
+	// --- ASHFRAME CUSTOM (Anti-xray) ---
+	/// Blocks that just became see-through. Their ore neighbours are re-sent on
+	/// the next update, where no chunk lock is held.
+	pendingOreReveal: main.List(Vec3i) = .empty,
+	// --- ASHFRAME CUSTOM (Anti-xray) ---
+
+
 	blockPalette: *main.assets.Palette = undefined,
 	itemPalette: *main.assets.Palette = undefined,
 	proceduralItemPalette: *main.assets.Palette = undefined,
@@ -533,8 +556,19 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 		self.chunkManager = try ChunkManager.init(self, worldData.getChild("generatorSettings"));
 		errdefer self.chunkManager.deinit();
 
-		try permission.loadGroups(try dir.openIterableDir("permission"));
+		try permission.loadGroups(try dir.openIterableDir("permission"), self.path);
 		std.debug.assert(main.entityModel.getById("cubyz:missing") != null);
+
+		// --- ASHFRAME CUSTOM (Progress) ---
+		server.claims.load(path);
+		server.alliances.load(path);
+		server.waypoints.load(path);
+		server.chatfilter.load(path);
+		server.shrines.load(path);
+		server.shops.load(path);
+		server.anticheat.load(path);
+		server.report.load(path);
+		// --- ASHFRAME CUSTOM (Progress) ---
 
 		return self;
 	}
@@ -558,6 +592,16 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 		self.saveItemdrops() catch |err| {
 			std.log.err("Error while saving item data: {s}", .{@errorName(err)});
 		};
+		// --- ASHFRAME CUSTOM (Progress) ---
+		server.claims.save(self.path);
+		server.alliances.save(self.path);
+		server.waypoints.save(self.path);
+		server.chatfilter.save(self.path);
+		server.shrines.save(self.path);
+		server.shops.save(self.path);
+		server.anticheat.save(self.path);
+		server.report.markCleanShutdown(self.path);
+		// --- ASHFRAME CUSTOM (Progress) ---
 		while (self.chunkUpdateQueue.popFront()) |updateRequest| {
 			updateRequest.ch.save(self);
 			updateRequest.ch.decreaseRefCount();
@@ -568,6 +612,7 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 			updateRequest.region.decreaseRefCount();
 		}
 		self.regionUpdateQueue.deinit();
+		self.pendingOreReveal.deinit(main.globalAllocator);
 		self.chunkManager.deinit();
 		self.itemDropManager.deinit();
 		self.blockPalette.deinit();
@@ -1099,10 +1144,38 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 		}
 	}
 
+	// --- ASHFRAME CUSTOM (Anti-xray) ---
+	/// Re-sends the real block for ores that just became exposed next to a block
+	/// that turned see-through. Runs outside any chunk lock, so reading the
+	/// neighbouring chunks is safe.
+	fn processPendingOreReveal(self: *ServerWorld) void {
+		if (self.pendingOreReveal.items.len == 0) return;
+		const positions = self.pendingOreReveal;
+		self.pendingOreReveal = .empty;
+		defer positions.deinit(main.globalAllocator);
+		const userList = server.getUserList(main.stackAllocator);
+		defer main.stackAllocator.free(userList);
+		for (positions.items) |pos| {
+			for (chunk.Neighbor.iterable) |value| {
+				const nx = pos[0] + value.relX();
+				const ny = pos[1] + value.relY();
+				const nz = pos[2] + value.relZ();
+				const nb = self.getBlock(nx, ny, nz) orelse continue;
+				if (!main.blocks.isOre(nb)) continue;
+				for (userList) |user| {
+					main.network.protocols.blockUpdate.send(user.conn, &.{.{.pos = .{nx, ny, nz}, .newBlock = nb, .blockEntityData = &.{}}});
+				}
+			}
+		}
+	}
+	// --- ASHFRAME CUSTOM (Anti-xray) ---
+
 	pub fn update(self: *ServerWorld) void { // MARK: update()
 		const newTime = main.timestamp();
 		var deltaTime = @as(f32, @floatFromInt(self.lastUpdateTime.durationTo(newTime).toNanoseconds()))/1.0e9;
 		self.lastUpdateTime = newTime;
+		main.server.report.sampleTick(deltaTime);
+		main.server.metrics.sampleTick(deltaTime);
 		if (deltaTime > 0.3) {
 			std.log.warn("Update time is getting too high. It's already at {} s!", .{deltaTime});
 			deltaTime = 0.3;
@@ -1120,6 +1193,7 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 				main.network.protocols.genericUpdate.sendTime(user.conn, self);
 			}
 		}
+		self.processPendingOreReveal();
 		self.tick();
 		// TODO: Entities
 
@@ -1154,6 +1228,70 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 					}
 				}
 				// --- ASHFRAME CUSTOM (Auto AFK) ---
+
+				// --- ASHFRAME CUSTOM (Title tracking) ---
+				if (prof.is_afk) prof.afk_time += deltaTime;
+				{
+					const p = prof.pos;
+					if (prof.last_track_pos) |last| {
+						// Horizontal distance only (Cubyz's vertical axis is index 2), so flying
+						// straight up doesn't count as travel.
+						const dx = p[0] - last[0];
+						const dy = p[1] - last[1];
+						const dist = @sqrt(dx*dx + dy*dy);
+						// Ignore teleport-sized jumps so /home, /tpa etc. don't count as travel.
+						if (dist < 32.0) prof.distance_travelled += dist;
+					}
+					prof.last_track_pos = p;
+					const height: f32 = @floatCast(p[2]);
+					if (prof.min_y == null or height < prof.min_y.?) prof.min_y = height;
+				}
+				server.titles.check(user);
+				// --- ASHFRAME CUSTOM (Title tracking) ---
+
+				// --- ASHFRAME CUSTOM (Teleport timeouts) ---
+				{
+					const now: i64 = @intCast(@divTrunc(main.timestamp().toNanoseconds(), 1000000000));
+					if (prof.tpa_request_from) |senderIndex| {
+						if (now - prof.tpa_request_time > server.Entity.teleportRequestTimeoutSeconds) {
+							prof.tpa_request_from = null;
+							if (server.getUserByIndex(senderIndex)) |sender| {
+								sender.sendMessage("#e6312cYour teleport request to #cfcfcf{s}#e6312c expired.", .{user.name});
+							}
+						}
+					}
+				}
+				// --- ASHFRAME CUSTOM (Teleport timeouts) ---
+
+				// --- ASHFRAME CUSTOM (Waypoints: stand-on teleport) ---
+				server.waypoints.check(user);
+				// --- ASHFRAME CUSTOM (Waypoints) ---
+
+				// --- ASHFRAME CUSTOM (Shrines: sky cores) ---
+				server.shrines.check(user);
+				// --- ASHFRAME CUSTOM (Shrines) ---
+
+				// --- ASHFRAME CUSTOM (Claims: border visualization) ---
+				{
+					const nowC: i64 = @intCast(@divTrunc(main.timestamp().toNanoseconds(), 1_000_000));
+					// The markers live for a few seconds, so a slow redraw looks the
+					// same but sends far fewer particle packets.
+					if (prof.showClaims and nowC - prof.lastClaimDraw > 1500) {
+						prof.lastClaimDraw = nowC;
+						server.claims.drawNearby(user, 64);
+					}
+				}
+				// --- ASHFRAME CUSTOM (Claims: border visualization) ---
+
+				// --- ASHFRAME CUSTOM (Biomes) ---
+				{
+					const nowB: i64 = @intCast(@divTrunc(main.timestamp().toNanoseconds(), 1000000000));
+					if (nowB - prof.last_biome_check > 30) {
+						prof.last_biome_check = nowB;
+						server.titles.sampleBiome(user);
+					}
+				}
+				// --- ASHFRAME CUSTOM (Biomes) ---
 			}
 		}
 		if (self.lastItemDropSaveTime.durationTo(newTime).toSeconds() > 5) {
@@ -1161,7 +1299,21 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 			self.saveItemdrops() catch |err| {
 				std.log.err("Error while saving item data: {s}", .{@errorName(err)});
 			};
+			// --- ASHFRAME CUSTOM (Progress) ---
+			server.claims.autosave(self.path);
+			server.alliances.autosave(self.path);
+			server.shrines.autosave(self.path);
+			server.chatfilter.autosave(self.path);
+			server.shops.autosave(self.path);
+			server.anticheat.autosave(self.path);
+			server.report.autosave(self.path);
+			// --- ASHFRAME CUSTOM (Progress) ---
 		}
+
+		// --- ASHFRAME CUSTOM (Deferred refunds) ---
+		// Flush queued item refunds outside of command processing.
+		server.progress.processRefunds();
+		// --- ASHFRAME CUSTOM (Deferred refunds) ---
 
 		// Store chunks and regions.
 		// Stores at least one chunk and one region per iteration.
@@ -1306,6 +1458,11 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 		for (userList) |user| {
 			main.network.protocols.blockUpdate.send(user.conn, &.{.{.pos = .{wx, wy, wz}, .newBlock = newBlock, .blockEntityData = &.{}}});
 		}
+		// --- ASHFRAME CUSTOM (Anti-xray): ores exposed by this change ---
+		if (main.settings.launchConfig.antiXray and newBlock.viewThrough() and self.pendingOreReveal.items.len < maxPendingOreReveal) {
+			self.pendingOreReveal.append(main.globalAllocator, .{wx, wy, wz});
+		}
+		// --- ASHFRAME CUSTOM (Anti-xray) ---
 		// onBreak event
 		if (oldBlock) |block| {
 			if (block.typ != newBlock.typ) {

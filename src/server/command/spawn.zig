@@ -27,7 +27,7 @@ pub const Args = union(enum) {
 /// but setting another player's spawn point or moving world spawn is an admin
 /// action - gated separately since argparse only has one permission per command.
 fn requireAdmin(source: Source) bool {
-	if (!source.hasPermission("/command/spawn/admin")) {
+	if (!source.hasPermission("/ashframe/admin/spawn")) {
 		source.sendMessage("#e6312cYou do not have permission to change spawn points.", .{});
 		return false;
 	}
@@ -46,6 +46,7 @@ pub fn execute(args: Args, source: Source) void {
 			// --- ASHFRAME CUSTOM (Bare /spawn teleports the caller) ---
 			if (params.playerIndex == null and source == .user) {
 				const user = source.user;
+				main.server.anticheat.expectTeleport(user);
 				main.network.protocols.genericUpdate.sendTPCoordinates(user.conn, user.getSpawnPos());
 				source.sendMessage("#cfcfcfTeleported to spawn.", .{});
 				return;

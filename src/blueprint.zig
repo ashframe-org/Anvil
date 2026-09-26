@@ -1,0 +1,708 @@
+const std = @import("std");
+
+const main = @import("main");
+const Compression = main.utils.Compression;
+const ZonElement = main.ZonElement;
+const vec = main.vec;
+const Vec3i = vec.Vec3i;
+
+const Array3D = main.utils.Array3D;
+const Block = main.blocks.Block;
+const NeverFailingAllocator = main.heap.NeverFailingAllocator;
+const User = main.server.User;
+const ServerChunk = main.chunk.ServerChunk;
+const Degrees = main.rotation.Degrees;
+const Tag = main.Tag;
+
+const BinaryWriter = main.utils.BinaryWriter;
+const BinaryReader = main.utils.BinaryReader;
+
+const AliasTable = main.utils.AliasTable;
+const List = main.List;
+
+const GameIdToBlueprintIdMapType = std.AutoHashMap(Block, BlockStorageType);
+const BlockIdSizeType = u32;
+const BlockStorageType = u32;
+
+pub const blueprintVersion = 1;
+/// Hard caps so a crafted `.blp` can't overflow the volume math or index the
+/// block palette out of bounds. Matches the WorldEdit selection cap.
+const maxBlueprintVolume: u64 = 262144;
+const maxPaletteEntries: u32 = 65536;
+var voidType: ?u16 = null;
+
+pub const BlueprintCompression = enum(u16) {
+	deflate,
+};
+
+pub const Blueprint = struct { // MARK: Blueprint
+	blocks: Array3D(Block),
+
+	pub fn init(allocator: NeverFailingAllocator) Blueprint {
+		return .{.blocks = .init(allocator, 0, 0, 0)};
+	}
+	pub fn deinit(self: Blueprint, allocator: NeverFailingAllocator) void {
+		self.blocks.deinit(allocator);
+	}
+	pub fn extent(self: Blueprint) Vec3i {
+		return .{
+			@intCast(self.blocks.width), @intCast(self.blocks.depth), @intCast(self.blocks.height),
+		};
+	}
+	pub fn clone(self: Blueprint, allocator: NeverFailingAllocator) Blueprint {
+		return .{.blocks = self.blocks.clone(allocator)};
+	}
+	pub fn rotateZ(self: Blueprint, allocator: NeverFailingAllocator, angle: Degrees) Blueprint {
+		var new = Blueprint{
+			.blocks = switch (angle) {
+				.@"0", .@"180" => .init(allocator, self.blocks.width, self.blocks.depth, self.blocks.height),
+				.@"90", .@"270" => .init(allocator, self.blocks.depth, self.blocks.width, self.blocks.height),
+			},
+		};
+
+		for (0..self.blocks.width) |xOld| {
+			for (0..self.blocks.depth) |yOld| {
+				const xNew, const yNew = switch (angle) {
+					.@"0" => .{xOld, yOld},
+					.@"90" => .{new.blocks.width - yOld - 1, xOld},
+					.@"180" => .{new.blocks.width - xOld - 1, new.blocks.depth - yOld - 1},
+					.@"270" => .{yOld, new.blocks.depth - xOld - 1},
+				};
+
+				for (0..self.blocks.height) |z| {
+					const block = self.blocks.get(xOld, yOld, z);
+					new.blocks.set(xNew, yNew, z, block.rotateZ(angle));
+				}
+			}
+		}
+		return new;
+	}
+
+	const CaptureResult = union(enum) {
+		success: Blueprint,
+		failure: struct { pos: Vec3i, message: []const u8 },
+	};
+
+	pub const Selection = struct {
+		/// Minimal position of a block, inclusive.
+		minPos: Vec3i,
+		/// Maximal position of a block, exclusive.
+		maxPos: Vec3i,
+
+		pub fn initFromInclusive(pos1Inclusive: Vec3i, pos2Inclusive: Vec3i) Selection {
+			return .{.minPos = @min(pos1Inclusive, pos2Inclusive), .maxPos = @max(pos1Inclusive, pos2Inclusive) +% @as(Vec3i, @splat(1))};
+		}
+
+		pub fn initFromExtent(pos1Inclusive: Vec3i, selectionExtent: Vec3i) Selection {
+			return .{.minPos = pos1Inclusive, .maxPos = pos1Inclusive + selectionExtent};
+		}
+
+		pub fn size(self: Selection) @Vector(3, u32) {
+			return @intCast(self.maxPos -% self.minPos);
+		}
+
+		/// Number of blocks in the selection, or null if it overflows u64.
+		/// Uses i64 math so a wrapped/invalid selection can't produce a huge
+		/// value that later under-allocates.
+		pub fn volume(self: Selection) ?u64 {
+			var v: u64 = 1;
+			const dims = [3]i64{
+				@as(i64, self.maxPos[0]) - self.minPos[0],
+				@as(i64, self.maxPos[1]) - self.minPos[1],
+				@as(i64, self.maxPos[2]) - self.minPos[2],
+			};
+			for (dims) |d| {
+				if (d <= 0) return 0;
+				v = std.math.mul(u64, v, @intCast(d)) catch return null;
+			}
+			return v;
+		}
+
+		pub fn format(self: Selection, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+			try writer.print("{} {}", .{self.minPos, self.maxPos});
+		}
+	};
+
+	pub fn capture(allocator: NeverFailingAllocator, selection: Selection) CaptureResult {
+		const startX, const startY, const startZ = selection.minPos;
+		const sizeX, const sizeY, const sizeZ = selection.size();
+
+		const self = Blueprint{.blocks = .init(allocator, sizeX, sizeY, sizeZ)};
+
+		for (0..sizeX) |x| {
+			const worldX = startX +% @as(i32, @intCast(x));
+
+			for (0..sizeY) |y| {
+				const worldY = startY +% @as(i32, @intCast(y));
+
+				for (0..sizeZ) |z| {
+					const worldZ = startZ +% @as(i32, @intCast(z));
+
+					const maybeBlock = main.server.world.?.getBlock(worldX, worldY, worldZ);
+					if (maybeBlock) |block| {
+						self.blocks.set(x, y, z, block);
+					} else {
+						return .{.failure = .{.pos = .{worldX, worldY, worldZ}, .message = "Chunk containing block not loaded."}};
+					}
+				}
+			}
+		}
+		return .{.success = self};
+	}
+
+	pub const PasteMode = enum { all, degradable };
+
+	pub fn pasteInGeneration(self: Blueprint, pos: Vec3i, chunk: *ServerChunk, mode: PasteMode) void {
+		switch (mode) {
+			inline else => |comptimeMode| _pasteInGeneration(self, pos, chunk, comptimeMode),
+		}
+	}
+
+	fn _pasteInGeneration(self: Blueprint, pos: Vec3i, chunk: *ServerChunk, comptime mode: PasteMode) void {
+		const indexEndX: i32 = @min(@as(i32, chunk.super.width) - pos[0], @as(i32, @intCast(self.blocks.width)));
+		const indexEndY: i32 = @min(@as(i32, chunk.super.width) - pos[1], @as(i32, @intCast(self.blocks.depth)));
+		const indexEndZ: i32 = @min(@as(i32, chunk.super.width) - pos[2], @as(i32, @intCast(self.blocks.height)));
+
+		var indexX: u31 = @max(0, -pos[0]);
+		while (indexX < indexEndX) : (indexX += chunk.super.pos.voxelSize) {
+			var indexY: u31 = @max(0, -pos[1]);
+			while (indexY < indexEndY) : (indexY += chunk.super.pos.voxelSize) {
+				var indexZ: u31 = @max(0, -pos[2]);
+				while (indexZ < indexEndZ) : (indexZ += chunk.super.pos.voxelSize) {
+					const block = self.blocks.get(indexX, indexY, indexZ);
+
+					if (block.typ == voidType) continue;
+
+					const chunkX = indexX + pos[0];
+					const chunkY = indexY + pos[1];
+					const chunkZ = indexZ + pos[2];
+					switch (mode) {
+						.all => chunk.updateBlockInGeneration(chunkX, chunkY, chunkZ, block),
+						.degradable => chunk.updateBlockIfDegradable(chunkX, chunkY, chunkZ, block),
+					}
+				}
+			}
+		}
+	}
+
+	pub const PasteFlags = struct {
+		preserveVoid: bool = false,
+	};
+
+	pub fn paste(self: Blueprint, pos: Vec3i, flags: PasteFlags) void {
+		const startX = pos[0];
+		const startY = pos[1];
+		const startZ = pos[2];
+
+		for (0..self.blocks.width) |x| {
+			const worldX = startX +% @as(i32, @intCast(x));
+
+			for (0..self.blocks.depth) |y| {
+				const worldY = startY +% @as(i32, @intCast(y));
+
+				for (0..self.blocks.height) |z| {
+					const worldZ = startZ +% @as(i32, @intCast(z));
+
+					const block = self.blocks.get(x, y, z);
+					if (block.typ != voidType or flags.preserveVoid) {
+						_ = main.server.world.?.updateBlock(worldX, worldY, worldZ, block);
+					}
+				}
+			}
+		}
+	}
+	pub fn load(allocator: NeverFailingAllocator, inputBuffer: []const u8) !Blueprint {
+		var compressedReader = BinaryReader.init(inputBuffer);
+		const version = try compressedReader.readInt(u16);
+
+		if (version > blueprintVersion) {
+			std.log.err("Blueprint version {d} is not supported. Current version is {d}.", .{version, blueprintVersion});
+			return error.UnsupportedVersion;
+		}
+		const compression = try compressedReader.readEnum(BlueprintCompression);
+		const blockPaletteSizeBytes = try compressedReader.readInt(u32);
+		const paletteBlockCount: u32 = if (version == 0) try compressedReader.readInt(u16) else try compressedReader.readInt(u32);
+		const width = try compressedReader.readInt(u16);
+		const depth = try compressedReader.readInt(u16);
+		const height = try compressedReader.readInt(u16);
+		// --- ASHFRAME CUSTOM (Anticheat): bound geometry/palette ---
+		const volume = @as(u64, width)*@as(u64, depth)*@as(u64, height);
+		if (volume == 0 or volume > maxBlueprintVolume) return error.InvalidBlueprint;
+		if (paletteBlockCount > maxPaletteEntries) return error.InvalidBlueprint;
+		// --- ASHFRAME CUSTOM (Anticheat) ---
+
+		const self = Blueprint{.blocks = .init(allocator, width, depth, height)};
+
+		const decompressedData = try self.decompressBuffer(compressedReader.remaining, blockPaletteSizeBytes, compression);
+		defer main.stackAllocator.free(decompressedData);
+		var decompressedReader = BinaryReader.init(decompressedData);
+
+		const palette = try loadBlockPalette(main.stackAllocator, paletteBlockCount, &decompressedReader);
+		defer main.stackAllocator.free(palette);
+
+		const blueprintIdToGameIdMap = makeBlueprintIdToGameIdMap(main.stackAllocator, palette);
+		defer main.stackAllocator.free(blueprintIdToGameIdMap);
+
+		for (self.blocks.mem) |*block| {
+			const blueprintBlockRaw = try decompressedReader.readInt(BlockStorageType);
+
+			if (version == 0) {
+				const blueprintBlock = Block.fromInt(blueprintBlockRaw);
+				// --- ASHFRAME CUSTOM (Anticheat): palette index bounds ---
+				if (@as(usize, blueprintBlock.typ) >= blueprintIdToGameIdMap.len) return error.InvalidBlueprint;
+				const gameBlockId = blueprintIdToGameIdMap[blueprintBlock.typ];
+
+				block.* = .{.typ = gameBlockId.typ, .data = blueprintBlock.data};
+			} else {
+				if (@as(usize, blueprintBlockRaw) >= blueprintIdToGameIdMap.len) return error.InvalidBlueprint;
+				block.* = blueprintIdToGameIdMap[blueprintBlockRaw];
+			}
+		}
+		return self;
+	}
+	pub fn store(self: Blueprint, allocator: NeverFailingAllocator) []u8 {
+		var gameIdToBlueprintId = self.makeGameIdToBlueprintIdMap(main.stackAllocator);
+		defer gameIdToBlueprintId.deinit();
+		std.debug.assert(gameIdToBlueprintId.count() != 0);
+
+		var uncompressedWriter = BinaryWriter.init(main.stackAllocator);
+		defer uncompressedWriter.deinit();
+
+		const blockPaletteSizeBytes = storeBlockPalette(gameIdToBlueprintId, &uncompressedWriter);
+
+		for (self.blocks.mem) |block| {
+			const blueprintBlock: BlockStorageType = gameIdToBlueprintId.get(block).?;
+			uncompressedWriter.writeInt(BlockStorageType, blueprintBlock);
+		}
+
+		const compressed = self.compressOutputBuffer(main.stackAllocator, uncompressedWriter.data.items);
+		defer main.stackAllocator.free(compressed.data);
+
+		var outputWriter = BinaryWriter.initCapacity(allocator, @sizeOf(i16) + @sizeOf(BlueprintCompression) + @sizeOf(u32) + @sizeOf(u16)*4 + compressed.data.len);
+
+		outputWriter.writeInt(u16, blueprintVersion);
+		outputWriter.writeEnum(BlueprintCompression, compressed.mode);
+		outputWriter.writeInt(u32, @intCast(blockPaletteSizeBytes));
+		outputWriter.writeInt(u32, @intCast(gameIdToBlueprintId.count()));
+		outputWriter.writeInt(u16, @intCast(self.blocks.width));
+		outputWriter.writeInt(u16, @intCast(self.blocks.depth));
+		outputWriter.writeInt(u16, @intCast(self.blocks.height));
+
+		outputWriter.writeSlice(compressed.data);
+
+		return outputWriter.data.toOwnedSlice();
+	}
+	fn makeBlueprintIdToGameIdMap(allocator: NeverFailingAllocator, palette: [][]const u8) []Block {
+		var blueprintIdToGameIdMap = allocator.alloc(Block, palette.len);
+
+		for (palette, 0..) |blockName, blueprintBlockId| {
+			const block = main.blocks.parseBlockWithOptions(blockName, .{.applyMigrations = true});
+			blueprintIdToGameIdMap[blueprintBlockId] = block;
+		}
+		return blueprintIdToGameIdMap;
+	}
+	fn makeGameIdToBlueprintIdMap(self: Blueprint, allocator: NeverFailingAllocator) GameIdToBlueprintIdMapType {
+		var gameIdToBlueprintId: GameIdToBlueprintIdMapType = .init(allocator.allocator);
+
+		for (self.blocks.mem) |block| {
+			const result = gameIdToBlueprintId.getOrPut(block) catch unreachable;
+			if (!result.found_existing) {
+				result.value_ptr.* = @intCast(gameIdToBlueprintId.count() - 1);
+			}
+		}
+
+		return gameIdToBlueprintId;
+	}
+	fn loadBlockPalette(allocator: NeverFailingAllocator, paletteBlockCount: usize, reader: *BinaryReader) ![][]const u8 {
+		var palette = allocator.alloc([]const u8, paletteBlockCount);
+
+		for (0..@intCast(paletteBlockCount)) |index| {
+			const blockNameSize = try reader.readInt(BlockIdSizeType);
+			const blockName = try reader.readSlice(blockNameSize);
+			palette[index] = blockName;
+		}
+		return palette;
+	}
+	fn storeBlockPalette(map: GameIdToBlueprintIdMapType, writer: *BinaryWriter) usize {
+		var blockPalette = main.stackAllocator.alloc(Block, map.count());
+		defer main.stackAllocator.free(blockPalette);
+
+		var iterator = map.iterator();
+		while (iterator.next()) |entry| {
+			blockPalette[entry.value_ptr.*] = entry.key_ptr.*;
+		}
+
+		std.log.info("Blueprint block palette:", .{});
+
+		var idAndDataList: main.ListManaged(u8) = .init(main.stackAllocator);
+		defer idAndDataList.deinit();
+
+		for (0..blockPalette.len) |index| {
+			idAndDataList.clearRetainingCapacity();
+			blockPalette[index].idAndData(&idAndDataList);
+			const blockName = idAndDataList.items;
+			std.log.info("palette[{d}]: {s}", .{index, blockName});
+
+			writer.writeInt(BlockIdSizeType, @intCast(blockName.len));
+			writer.writeSlice(blockName);
+		}
+
+		return writer.data.items.len;
+	}
+	fn decompressBuffer(self: Blueprint, data: []const u8, blockPaletteSizeBytes: usize, compression: BlueprintCompression) ![]u8 {
+		const blockArraySizeBytes = self.blocks.width*self.blocks.depth*self.blocks.height*@sizeOf(BlockStorageType);
+		const decompressedDataSizeBytes = blockPaletteSizeBytes + blockArraySizeBytes;
+
+		const decompressedData = main.stackAllocator.alloc(u8, decompressedDataSizeBytes);
+
+		switch (compression) {
+			.deflate => {
+				const sizeAfterDecompression = try Compression.inflateTo(decompressedData, data);
+				std.debug.assert(sizeAfterDecompression == decompressedDataSizeBytes);
+			},
+		}
+		return decompressedData;
+	}
+	fn compressOutputBuffer(_: Blueprint, allocator: NeverFailingAllocator, decompressedData: []u8) struct { mode: BlueprintCompression, data: []u8 } {
+		const compressionMode: BlueprintCompression = .deflate;
+		switch (compressionMode) {
+			.deflate => {
+				return .{.mode = .deflate, .data = Compression.deflate(allocator, decompressedData, .default)};
+			},
+		}
+	}
+	pub fn replace(self: *Blueprint, whitelist: ?Mask, blacklist: ?Mask, newBlocks: Pattern) void {
+		for (0..self.blocks.width) |x| {
+			for (0..self.blocks.depth) |y| {
+				for (0..self.blocks.height) |z| {
+					const current = self.blocks.get(x, y, z);
+					if (whitelist) |m| if (!m.match(current)) continue;
+					if (blacklist) |m| if (m.match(current)) continue;
+					self.blocks.set(x, y, z, newBlocks.blocks.sample(&main.seed).block);
+				}
+			}
+		}
+	}
+
+	pub fn apply(self: *Blueprint, context: anytype, applyFunction: fn (context: @TypeOf(context), block: Block) Block) void {
+		for (self.blocks.mem) |*block| {
+			block.* = applyFunction(context, block.*);
+		}
+	}
+};
+
+pub const Pattern = struct {
+	const weightSeparator = '%';
+	const expressionSeparator = ',';
+
+	blocks: AliasTable(Entry),
+
+	const Entry = struct {
+		block: Block,
+		chance: f32,
+	};
+
+	pub fn initFromString(allocator: NeverFailingAllocator, source: []const u8) !@This() {
+		var specifiers = std.mem.splitScalar(u8, source, expressionSeparator);
+		var totalWeight: f32 = 0;
+
+		var weightedEntries: List(struct { block: Block, weight: f32 }) = .empty;
+		defer weightedEntries.deinit(main.stackAllocator);
+
+		while (specifiers.next()) |specifier| {
+			var blockId = specifier;
+			var weight: f32 = 1.0;
+
+			if (std.mem.containsAtLeastScalar(u8, specifier, 1, weightSeparator)) {
+				var iterator = std.mem.splitScalar(u8, specifier, weightSeparator);
+				const weightString = iterator.first();
+				blockId = iterator.rest();
+
+				weight = std.fmt.parseFloat(f32, weightString) catch return error.@"Weight not a valid number";
+				if (weight <= 0) return error.@"Weight must be greater than 0";
+			}
+
+			_ = main.blocks.getBlockById(blockId) catch return error.@"Block not found";
+			const block = main.blocks.parseBlock(blockId);
+
+			totalWeight += weight;
+			weightedEntries.append(main.stackAllocator, .{.block = block, .weight = weight});
+		}
+
+		const entries = allocator.alloc(Entry, weightedEntries.items.len);
+		for (weightedEntries.items, 0..) |entry, i| {
+			entries[i] = .{.block = entry.block, .chance = entry.weight/totalWeight};
+		}
+
+		return .{.blocks = .init(allocator, entries)};
+	}
+
+	pub fn deinit(self: @This(), allocator: NeverFailingAllocator) void {
+		self.blocks.deinit(allocator);
+		allocator.free(self.blocks.items);
+	}
+};
+
+pub const Mask = struct { // MARK: Mask
+	const AndList = List(Entry);
+	const OrList = List(AndList);
+
+	entries: OrList,
+
+	const or_ = '|';
+	const and_ = '&';
+	const tag = '$';
+	const property = '@';
+
+	const Entry = struct {
+		inner: Inner,
+		isInverse: bool,
+
+		const Inner = union(enum) {
+			block: Block,
+			blockType: u16,
+			blockTag: Tag,
+			blockProperty: Property,
+
+			const Property = blk: {
+				var fieldNames: [@typeInfo(Block).@"struct".decls.len][]const u8 = undefined;
+				var fieldValues: [@typeInfo(Block).@"struct".decls.len]u8 = undefined;
+				var count = 0;
+
+				for (std.meta.declarations(Block)) |decl| {
+					const declInfo = @typeInfo(@TypeOf(@field(Block, decl.name)));
+					if (declInfo != .@"fn") continue;
+					if (declInfo.@"fn".return_type != bool) continue;
+					if (declInfo.@"fn".params.len != 1) continue;
+
+					fieldNames[count] = decl.name;
+					fieldValues[count] = count;
+					count += 1;
+				}
+
+				break :blk @Enum(u8, .exhaustive, fieldNames[0..count], fieldValues[0..count]);
+			};
+
+			fn initFromString(specifier: []const u8) !Inner {
+				return switch (specifier[0]) {
+					tag => .{.blockTag = Tag.get(specifier[1..]) orelse return error.TagNotFound},
+					property => .{.blockProperty = std.meta.stringToEnum(Property, specifier[1..]) orelse return error.PropertyNotFound},
+					else => return try parseBlockLike(specifier),
+				};
+			}
+
+			fn match(self: Inner, block: Block) bool {
+				return switch (self) {
+					.block => |desired| block.typ == desired.typ and block.data == desired.data,
+					.blockType => |desired| block.typ == desired,
+					.blockTag => |desired| block.hasTag(desired),
+					.blockProperty => |blockProperty| switch (blockProperty) {
+						inline else => |prop| @field(Block, @tagName(prop))(block),
+					},
+				};
+			}
+		};
+
+		fn initFromString(specifier: []const u8) !Entry {
+			const isInverse = specifier[0] == '!';
+			const entry = try Inner.initFromString(specifier[if (isInverse) 1 else 0..]);
+			return .{.inner = entry, .isInverse = isInverse};
+		}
+
+		pub fn match(self: Entry, block: Block) bool {
+			const isMatch = self.inner.match(block);
+			if (self.isInverse) {
+				return !isMatch;
+			}
+			return isMatch;
+		}
+	};
+
+	pub fn initFromString(allocator: NeverFailingAllocator, source: []const u8) !@This() {
+		var result: @This() = .{.entries = .empty};
+		errdefer result.deinit(allocator);
+
+		var oredExpressions = std.mem.splitScalar(u8, source, or_);
+		while (oredExpressions.next()) |subExpression| {
+			if (subExpression.len == 0) return error.MissingExpression;
+
+			var andStorage: AndList = .empty;
+			errdefer andStorage.deinit(allocator);
+
+			var andedExpressions = std.mem.splitScalar(u8, subExpression, and_);
+			while (andedExpressions.next()) |specifier| {
+				if (specifier.len == 0) return error.MissingExpression;
+
+				const entry = try Entry.initFromString(specifier);
+				andStorage.append(allocator, entry);
+			}
+			std.debug.assert(andStorage.items.len != 0);
+
+			result.entries.append(allocator, andStorage);
+		}
+		std.debug.assert(result.entries.items.len != 0);
+
+		return result;
+	}
+
+	pub fn deinit(self: @This(), allocator: NeverFailingAllocator) void {
+		for (self.entries.items) |andStorage| {
+			andStorage.deinit(allocator);
+		}
+		self.entries.deinit(allocator);
+	}
+
+	pub fn clone(self: Mask, allocator: NeverFailingAllocator) Mask {
+		var orListCopy: OrList = .initCapacity(allocator, self.entries.items.len);
+
+		for (self.entries.items) |andList| {
+			var andListCopy: AndList = .initCapacity(allocator, andList.items.len);
+			defer orListCopy.appendAssumeCapacity(andListCopy);
+
+			for (andList.items) |entry| {
+				andListCopy.appendAssumeCapacity(entry);
+			}
+		}
+		return .{.entries = orListCopy};
+	}
+
+	pub fn match(self: @This(), block: Block) bool {
+		for (self.entries.items) |andedExpressions| {
+			const status = blk: {
+				for (andedExpressions.items) |expression| {
+					if (!expression.match(block)) break :blk false;
+				}
+				break :blk true;
+			};
+
+			if (status) return true;
+		}
+		return false;
+	}
+};
+
+fn parseBlockLike(block: []const u8) error{ DataParsingFailed, IdParsingFailed }!Mask.Entry.Inner {
+	if (@import("builtin").is_test) return try Test.parseBlockLikeTest(block);
+	const typ = main.blocks.getBlockById(block) catch return error.IdParsingFailed;
+	const dataNullable = main.blocks.getBlockData(block) catch return error.DataParsingFailed;
+	if (dataNullable) |data| return .{.block = .{.typ = typ, .data = data}};
+	return .{.blockType = typ};
+}
+
+const Test = struct {
+	var parseBlockLikeTest: *const @TypeOf(parseBlockLike) = &defaultParseBlockLike;
+
+	fn defaultParseBlockLike(_: []const u8) !Mask.Entry.Inner {
+		unreachable;
+	}
+
+	fn @"parseBlockLike 1 null"(_: []const u8) !Mask.Entry.Inner {
+		return .{.blockType = 1};
+	}
+	fn @"parseBlockLike 1 1"(_: []const u8) !Mask.Entry.Inner {
+		return .{.block = .{.typ = 1, .data = 1}};
+	}
+
+	fn @"parseBlockLike foo or bar"(data: []const u8) !Mask.Entry.Inner {
+		if (std.mem.eql(u8, data, "addon:foo")) {
+			return .{.block = .{.typ = 1, .data = 0}};
+		}
+		if (std.mem.eql(u8, data, "addon:bar")) {
+			return .{.block = .{.typ = 2, .data = 0}};
+		}
+		unreachable;
+	}
+};
+
+test "Mask match block type with any data" {
+	Test.parseBlockLikeTest = &Test.@"parseBlockLike 1 null";
+	defer Test.parseBlockLikeTest = &Test.defaultParseBlockLike;
+
+	const mask = try Mask.initFromString(main.heap.testingAllocator, "addon:dummy");
+	defer mask.deinit(main.heap.testingAllocator);
+
+	try std.testing.expect(mask.match(.{.typ = 1, .data = 0}));
+	try std.testing.expect(mask.match(.{.typ = 1, .data = 1}));
+	try std.testing.expect(!mask.match(.{.typ = 2, .data = 0}));
+}
+
+test "Mask empty negative case" {
+	Test.parseBlockLikeTest = &Test.@"parseBlockLike 1 null";
+	defer Test.parseBlockLikeTest = &Test.defaultParseBlockLike;
+
+	try std.testing.expectError(error.MissingExpression, Mask.initFromString(main.heap.testingAllocator, ""));
+}
+
+test "Mask half-or negative case" {
+	Test.parseBlockLikeTest = &Test.@"parseBlockLike 1 null";
+	defer Test.parseBlockLikeTest = &Test.defaultParseBlockLike;
+
+	try std.testing.expectError(error.MissingExpression, Mask.initFromString(main.heap.testingAllocator, "addon:dummy|"));
+}
+
+test "Mask half-or negative case 2" {
+	Test.parseBlockLikeTest = &Test.@"parseBlockLike 1 null";
+	defer Test.parseBlockLikeTest = &Test.defaultParseBlockLike;
+
+	try std.testing.expectError(error.MissingExpression, Mask.initFromString(main.heap.testingAllocator, "|addon:dummy"));
+}
+
+test "Mask half-and negative case" {
+	Test.parseBlockLikeTest = &Test.@"parseBlockLike 1 null";
+	defer Test.parseBlockLikeTest = &Test.defaultParseBlockLike;
+
+	try std.testing.expectError(error.MissingExpression, Mask.initFromString(main.heap.testingAllocator, "addon:dummy&"));
+}
+
+test "Mask half-and negative case 2" {
+	Test.parseBlockLikeTest = &Test.@"parseBlockLike 1 null";
+	defer Test.parseBlockLikeTest = &Test.defaultParseBlockLike;
+
+	try std.testing.expectError(error.MissingExpression, Mask.initFromString(main.heap.testingAllocator, "&addon:dummy"));
+}
+
+test "Mask inverse match block type with any data" {
+	Test.parseBlockLikeTest = &Test.@"parseBlockLike 1 null";
+	defer Test.parseBlockLikeTest = &Test.defaultParseBlockLike;
+
+	const mask = try Mask.initFromString(main.heap.testingAllocator, "!addon:dummy");
+	defer mask.deinit(main.heap.testingAllocator);
+
+	try std.testing.expect(!mask.match(.{.typ = 1, .data = 0}));
+	try std.testing.expect(!mask.match(.{.typ = 1, .data = 1}));
+	try std.testing.expect(mask.match(.{.typ = 2, .data = 0}));
+}
+
+test "Mask match block type with exact data" {
+	Test.parseBlockLikeTest = &Test.@"parseBlockLike 1 1";
+	defer Test.parseBlockLikeTest = &Test.defaultParseBlockLike;
+
+	const mask = try Mask.initFromString(main.heap.testingAllocator, "addon:dummy");
+	defer mask.deinit(main.heap.testingAllocator);
+
+	try std.testing.expect(!mask.match(.{.typ = 1, .data = 0}));
+	try std.testing.expect(mask.match(.{.typ = 1, .data = 1}));
+	try std.testing.expect(!mask.match(.{.typ = 2, .data = 1}));
+}
+
+test "Mask match type 0 or type 1 with exact data" {
+	Test.parseBlockLikeTest = &Test.@"parseBlockLike foo or bar";
+	defer Test.parseBlockLikeTest = &Test.defaultParseBlockLike;
+
+	const mask = try Mask.initFromString(main.heap.testingAllocator, "addon:foo|addon:bar");
+	defer mask.deinit(main.heap.testingAllocator);
+
+	try std.testing.expect(mask.match(.{.typ = 1, .data = 0}));
+	try std.testing.expect(mask.match(.{.typ = 2, .data = 0}));
+	try std.testing.expect(!mask.match(.{.typ = 1, .data = 1}));
+	try std.testing.expect(!mask.match(.{.typ = 2, .data = 1}));
+}
+
+pub fn registerVoidBlock(block: Block) void {
+	voidType = block.typ;
+	std.debug.assert(voidType != 0);
+}
+
+pub fn getVoidBlock() Block {
+	return Block{.typ = voidType.?, .data = 0};
+}

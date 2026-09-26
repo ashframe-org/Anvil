@@ -3,8 +3,9 @@ const std = @import("std");
 const main = @import("main");
 const command = main.server.command;
 const Source = command.Source;
+const ashutil = @import("ashutil.zig");
 
-pub const description = "Teleport back to your previous location.";
+pub const description = "Teleport back to your previous location. Costs 1 Amber Orb.";
 pub const usage = "/back";
 
 pub const Args = union(enum) {
@@ -25,6 +26,8 @@ pub fn execute(args: Args, source: Source) void {
 		return;
 	};
 
+	if (!ashutil.chargeOrbs(user, source, 1)) return;
+	main.server.anticheat.expectTeleport(user);
 	main.network.protocols.genericUpdate.sendTPCoordinates(user.conn, target_pos);
 	source.sendMessage("#cfcfcfTeleported back to your previous location.", .{});
 

@@ -1,0 +1,19 @@
+.{
+	.tags = .{.mineable},
+	.blockHealth = 120,
+	.blockResistance = 6,
+	.drops = .{
+		.{.items = .{.auto}},
+	},
+	.model = "cubyz:cube",
+	.emittedLight = 0x1a3a5a,
+	.texture = "ashframe:skycore_side",
+	.texture_front = "ashframe:skycore_side",
+	.texture_left = "ashframe:skycore_side",
+	.texture_right = "ashframe:skycore_side",
+	.texture_top = "ashframe:skycore_top",
+	.texture_bottom = "cubyz:nimbusite/pillar_bottom",
+	.item = .{
+		.name = "Sky Core",
+	},
+}

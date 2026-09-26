@@ -1,0 +1,6 @@
+.{
+	.name = "Amber Orb",
+	.texture = "amber_orb.png",
+	.stackSize = 16,
+	.tags = .{.precious},
+}

@@ -20,30 +20,49 @@ pub const Args = union(enum) {
 /// from Cubyz's own (default) commands.
 const customCommandNames = std.StaticStringMap(void).initComptime(.{
 	.{"home", {}},
+	.{"add", {}},
+	.{"waypoint", {}},
+	.{"unban", {}},
+	.{"ban", {}},
+	.{"bans", {}},
+	.{"skyscan", {}},
+	.{"sethome", {}},
+	.{"delhome", {}},
+	.{"homes", {}},
 	.{"tpa", {}},
 	.{"tpaccept", {}},
 	.{"tpdeny", {}},
 	.{"back", {}},
 	.{"players", {}},
 	.{"playtime", {}},
+	.{"stats", {}},
 	.{"afk", {}},
 	.{"prefix", {}},
 	.{"msg", {}},
+	.{"claim", {}},
+	.{"eat", {}},
+	.{"titles", {}},
+	.{"title", {}},
+	.{"shop", {}},
+	.{"report", {}},
 	.{"ashutil", {}},
 });
 
-fn isCustomCommand(name: []const u8) bool {
-	return customCommandNames.has(name);
+const Group = enum { default, custom };
+
+fn groupOf(name: []const u8) Group {
+	if (customCommandNames.has(name)) return .custom;
+	return .default;
 }
 
-fn appendCommandList(msg: *main.ListManaged(u8), source: Source, wantCustom: bool) void {
+fn appendGroup(msg: *main.ListManaged(u8), source: Source, group: Group) void {
 	var names: main.ListManaged([]const u8) = .init(main.stackAllocator);
 	defer names.deinit();
 
 	var iterator = command.commands.valueIterator();
 	while (iterator.next()) |cmd| {
 		if (!source.hasPermission(cmd.permissionPath)) continue;
-		if (isCustomCommand(cmd.name) != wantCustom) continue;
+		if (groupOf(cmd.name) != group) continue;
 		names.append(cmd.name);
 	}
 
@@ -71,10 +90,10 @@ pub fn execute(args: Args, source: Source) void {
 		.@"/help" => {
 			// --- ASHFRAME CUSTOM (Command grouping for /help) ---
 			msg.appendSlice("#f2f2f2Default\n");
-			appendCommandList(&msg, source, false);
+			appendGroup(&msg, source, .default);
 			msg.appendSlice("\n#f2f2f2Custom\n");
-			appendCommandList(&msg, source, true);
-			msg.appendSlice("\n#4a4a4aUse /help <command> for usage of a specific command.\n");
+			appendGroup(&msg, source, .custom);
+			msg.appendSlice("\n#9a9a9aUse /help <command> for usage of a specific command.\n");
 			// --- ASHFRAME CUSTOM (Command grouping for /help) ---
 		},
 		.@"/help <command>" => |params| {
@@ -90,7 +109,7 @@ pub fn execute(args: Args, source: Source) void {
 			msg.appendSlice("#8a8a8a: ");
 			msg.appendSlice(cmd.description);
 			msg.append('\n');
-			msg.appendSlice("#4a4a4a");
+			msg.appendSlice("#9a9a9a");
 			msg.appendSlice(cmd.usage);
 			msg.append('\n');
 		},

@@ -7,6 +7,11 @@ const Vec3f = vec.Vec3f;
 const Vec3d = vec.Vec3d;
 const NeverFailingAllocator = main.heap.NeverFailingAllocator;
 
+// --- ASHFRAME CUSTOM (Teleport costs) ---
+/// How long a `/tpa` request stays valid.
+pub const teleportRequestTimeoutSeconds: i64 = 30;
+// --- ASHFRAME CUSTOM (Teleport costs) ---
+
 pos: Vec3d = .{0, 0, 0},
 vel: Vec3d = .{0, 0, 0},
 rot: Vec3f = .{0, 0, 0},
@@ -16,11 +21,65 @@ prefix: ?[]const u8 = null,
 tpa_request_from: ?usize = null,
 still_time: f32 = 0.0,
 is_afk: bool = false,
-home_pos: ?Vec3d = null,
-back_pos: ?Vec3d = null,
-playtime: u64 = 0,
-login_time: i64 = 0,
-// --- ASHFRAME CUSTOM (Fields) ---
+	home_pos: ?Vec3d = null,
+	homeUnlocked: bool = false,
+	back_pos: ?Vec3d = null,
+	waypointPending: ?Vec3d = null,
+	playtime: u64 = 0,
+	login_time: i64 = 0,
+
+	// --- ASHFRAME CUSTOM (Progress: skills) ---
+	blocksMined: u64 = 0,
+	blocksPlaced: u64 = 0,
+	loginStreak: u16 = 0,
+	streakMonth: u32 = 0,
+	lastRewardDay: i64 = -1,
+	veteranLimboNotified: bool = false,
+	strikes: u8 = 0,
+	// Set by the chat filter on the network thread; the server thread performs
+	// the actual message/disconnect/save so teardown never runs off-thread.
+	pendingBan: bool = false,
+	// Set by the anticheat on the network thread after sustained speed
+	// violations; the server thread kicks so teardown never runs off-thread.
+	pendingKick: bool = false,
+	// Session-only (not persisted): movement-violation count + window start
+	// for the repeat-speeder auto-kick.
+	moveViolations: u32 = 0,
+	moveViolationWindowStart: i64 = 0,
+	seenBiomes: ?[]const u8 = null,
+	// Session-only (not persisted):
+	last_biome_check: i64 = 0,
+	// --- ASHFRAME CUSTOM (Progress) ---
+
+	// --- ASHFRAME CUSTOM (Titles) ---
+	titles: u64 = 0,
+	active_title: ?u8 = null,
+	messages_sent: u32 = 0,
+	afk_time: f32 = 0,
+	days_played: u16 = 0,
+	last_played_day: i64 = -1,
+	distance_travelled: f64 = 0,
+	min_y: ?f32 = null,
+	apples_eaten: u32 = 0,
+	shopTrades: u32 = 0,
+	// Session-only (not persisted):
+	last_sky_check: i64 = 0,
+	last_track_pos: ?Vec3d = null,
+	// --- ASHFRAME CUSTOM (Titles) ---
+
+	// --- ASHFRAME CUSTOM (Teleport costs) ---
+	// Session-only (not persisted):
+	tpa_request_time: i64 = 0,
+	showClaims: bool = false,
+	lastClaimDraw: i64 = 0,
+	waypointCooldownUntil: i64 = 0,
+	/// Monotonic second of the last "teleport ready in Ns" notice shown while
+	/// standing on a waypoint/sky anchor during its cooldown. Throttles the
+	/// notice (a jump looks like stepping off and back on, which re-fired the
+	/// old once-per-stand latch every hop). Session-only, never persisted.
+	anchorCooldownNotifiedAt: i64 = 0,
+	// --- ASHFRAME CUSTOM (Teleport costs) ---
+	// --- ASHFRAME CUSTOM (Fields) ---
 
 health: f32 = 8,
 maxHealth: f32 = 8,
@@ -40,6 +99,29 @@ pub fn loadFrom(self: *@This(), id: main.entity.Entity, zon: ZonElement, comptim
 	// --- ASHFRAME CUSTOM (loadFrom) ---
 	self.playtime = zon.get(u64, "playtime") orelse 0;
 	self.login_time = @intCast(@divTrunc(main.timestamp().toNanoseconds(), 1000000000));
+
+	self.titles = zon.get(u64, "titles") orelse 0;
+	self.active_title = zon.get(u8, "active_title");
+	self.messages_sent = zon.get(u32, "messages_sent") orelse 0;
+	self.afk_time = zon.get(f32, "afk_time") orelse 0;
+	self.days_played = zon.get(u16, "days_played") orelse 0;
+	self.last_played_day = zon.get(i64, "last_played_day") orelse -1;
+	self.distance_travelled = zon.get(f64, "distance_travelled") orelse 0;
+	self.min_y = zon.get(f32, "min_y");
+	self.apples_eaten = zon.get(u32, "apples_eaten") orelse 0;
+	self.shopTrades = zon.get(u32, "shop_trades") orelse 0;
+
+	self.blocksMined = zon.get(u64, "blocks_mined") orelse 0;
+	self.blocksPlaced = zon.get(u64, "blocks_placed") orelse 0;
+	self.loginStreak = zon.get(u16, "login_streak") orelse 0;
+	self.streakMonth = zon.get(u32, "streak_month") orelse 0;
+	self.lastRewardDay = zon.get(i64, "last_reward_day") orelse -1;
+	self.veteranLimboNotified = zon.get(bool, "veteran_limbo_notified") orelse false;
+	self.strikes = zon.get(u8, "strikes") orelse 0;
+	if (zon.get([]const u8, "seen_biomes")) |s| {
+		if (self.seenBiomes) |old| main.globalAllocator.free(old);
+		self.seenBiomes = main.globalAllocator.dupe(u8, s);
+	}
 	// --- ASHFRAME CUSTOM (loadFrom) ---
 
 	if (zon.getChildOrNull("components")) |components| {
@@ -55,9 +137,17 @@ pub fn loadFrom(self: *@This(), id: main.entity.Entity, zon: ZonElement, comptim
 
 	// --- ASHFRAME CUSTOM (loadFrom) ---
 	self.back_pos = zon.get(Vec3d, "back_pos");
+	self.homeUnlocked = zon.get(bool, "home_unlocked") orelse false;
+	self.waypointPending = zon.get(Vec3d, "waypoint_pending");
 
-	// Single-home format.
-	if (zon.get(Vec3d, "home_pos")) |hp| {
+	// Multi-slot saves fold into slot 1; then single-home, then legacy.
+	if (zon.get(Vec3d, "home_slot_1")) |hp| {
+		self.home_pos = hp;
+	} else if (zon.get(Vec3d, "home_slot_2")) |hp| {
+		self.home_pos = hp;
+	} else if (zon.get(Vec3d, "home_slot_3")) |hp| {
+		self.home_pos = hp;
+	} else if (zon.get(Vec3d, "home_pos")) |hp| {
 		self.home_pos = hp;
 	} else {
 		// Backward compatibility with the old 3-slot format: prefer whichever slot
@@ -89,9 +179,10 @@ pub fn clone(self: *@This(), copy: *@This()) void {
 	copy.* = self.*;
 	copy.name = if (self.name) |name| main.globalAllocator.dupe(u8, name) else null;
 
-	// --- ASHFRAME CUSTOM (clone) ---
-	copy.prefix = if (self.prefix) |p| main.globalAllocator.dupe(u8, p) else null;
-	// --- ASHFRAME CUSTOM (clone) ---
+// --- ASHFRAME CUSTOM (clone) ---
+copy.prefix = if (self.prefix) |p| main.globalAllocator.dupe(u8, p) else null;
+copy.seenBiomes = if (self.seenBiomes) |s| main.globalAllocator.dupe(u8, s) else null;
+// --- ASHFRAME CUSTOM (clone) ---
 
 	copy.id = originalID;
 }
@@ -109,6 +200,26 @@ pub fn save(self: *const @This(), allocator: NeverFailingAllocator, audience: ma
 	const current_time: i64 = @intCast(@divTrunc(main.timestamp().toNanoseconds(), 1000000000));
 	const session_seconds = if (current_time > self.login_time) current_time - self.login_time else 0;
 	zon.put("playtime", self.playtime + @as(u64, @intCast(session_seconds)));
+
+	zon.put("titles", self.titles);
+	if (self.active_title) |active| zon.put("active_title", active);
+	zon.put("messages_sent", self.messages_sent);
+	zon.put("afk_time", self.afk_time);
+	zon.put("days_played", self.days_played);
+	zon.put("last_played_day", self.last_played_day);
+	zon.put("distance_travelled", self.distance_travelled);
+	if (self.min_y) |y| zon.put("min_y", y);
+	zon.put("apples_eaten", self.apples_eaten);
+	zon.put("shop_trades", self.shopTrades);
+
+	zon.put("blocks_mined", self.blocksMined);
+	zon.put("blocks_placed", self.blocksPlaced);
+	zon.put("login_streak", self.loginStreak);
+	zon.put("streak_month", self.streakMonth);
+	zon.put("last_reward_day", self.lastRewardDay);
+	if (self.veteranLimboNotified) zon.put("veteran_limbo_notified", self.veteranLimboNotified);
+	if (self.strikes != 0) zon.put("strikes", self.strikes);
+	if (self.seenBiomes) |s| zon.put("seen_biomes", s);
 	// --- ASHFRAME CUSTOM (save) ---
 
 	var base64 = main.entity.server.componentsToBase64(allocator, self.id, audience);
@@ -119,6 +230,8 @@ pub fn save(self: *const @This(), allocator: NeverFailingAllocator, audience: ma
 	if (self.back_pos) |bp| {
 		zon.put("back_pos", bp);
 	}
+	if (self.homeUnlocked) zon.put("home_unlocked", self.homeUnlocked);
+	if (self.waypointPending) |wp| zon.put("waypoint_pending", wp);
 	if (self.home_pos) |hp| {
 		zon.put("home_pos", hp);
 	}
@@ -137,6 +250,10 @@ pub fn deinit(self: *@This(), comptime side: main.sync.Side) void {
 	if (self.prefix) |p| {
 		main.globalAllocator.free(p);
 		self.prefix = null;
+	}
+	if (self.seenBiomes) |s| {
+		main.globalAllocator.free(s);
+		self.seenBiomes = null;
 	}
 	// --- ASHFRAME CUSTOM (deinit) ---
 

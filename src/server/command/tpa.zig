@@ -5,7 +5,7 @@ const command = main.server.command;
 const Source = command.Source;
 const ashutil = @import("ashutil.zig");
 
-pub const description = "Request to teleport to another player.";
+pub const description = "Request to teleport to another player. Costs 1 Amber Orb on accept.";
 pub const usage = "/tpa <player>";
 
 pub const Args = union(enum) {
@@ -30,7 +30,5 @@ pub fn execute(args: Args, source: Source) void {
 		return;
 	}
 
-	target.player().tpa_request_from = user.playerIndex;
-	source.sendMessage("#cfcfcfTeleport request sent to #e6312c{s}#cfcfcf.", .{target.name});
-	target.sendMessage("#e6312c{s} #cfcfcfwants to teleport to you. Type #e6312c/tpaccept #cfcfcfto accept.", .{user.name});
+	ashutil.sendTpaRequest(user, target);
 }

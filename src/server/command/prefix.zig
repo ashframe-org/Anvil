@@ -16,7 +16,7 @@ pub const Args = union(enum) {
 };
 
 pub fn execute(args: Args, source: Source) void {
-	if (!source.hasPermission("/command/prefix/admin")) {
+	if (!source.hasPermission("/ashframe/admin/prefix")) {
 		source.sendMessage("#e6312cYou do not have permission to manage player prefixes.", .{});
 		return;
 	}

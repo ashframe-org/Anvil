@@ -1,0 +1,5 @@
+.{
+	.blueprints = .{
+		.{.id = "ashframe:struct/ancient_sky_shrine"},
+	},
+}

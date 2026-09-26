@@ -1,0 +1,6 @@
+.{
+	.name = "Core Fragment",
+	.texture = "core_fragment.png",
+	.stackSize = 64,
+	.tags = .{.precious},
+}

@@ -16,7 +16,7 @@ pub const Args = union(enum) {
 
 pub fn execute(args: Args, source: Source) void {
 	switch (args) {
-		.@"/tickspeed <rate>" => |tickSpeed| main.server.world.?.tickSpeed.store(tickSpeed.rate, .monotonic),
+		.@"/tickspeed <rate>" => |tickSpeed| main.server.world.?.tickSpeed.store(@min(tickSpeed.rate, 1000), .monotonic),
 		.@"/tickspeed" => {},
 	}
 	source.sendMessage("#ffff00{}", .{main.server.world.?.tickSpeed.load(.monotonic)});

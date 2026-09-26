@@ -1,0 +1,14 @@
+.{
+	.{
+		.inputs = .{"4 cubyz:glass/white", "6 cubyz:amber_ore"},
+		.output = "10 ashframe:amber_orb",
+	},
+	.{
+		.inputs = .{"4 ashframe:core_fragment", "16 cubyz:iron_ingot", "4 cubyz:glass/white"},
+		.output = "ashframe:sky_core",
+	},
+	.{
+		.inputs = .{"16 cubyz:nimbusite/tile", "8 cubyz:glass/white", "6 ashframe:amber_orb"},
+		.output = "2 ashframe:waypoint",
+	},
+}

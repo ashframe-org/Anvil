@@ -1,0 +1,6 @@
+.{
+	.texture = "ashframe:green_poof",
+	.density = .{0.001, 0.001},
+	.rotationVelocity = .{0, 0},
+	.dragCoefficient = .{0.9, 1.0},
+}

@@ -3,6 +3,7 @@ const std = @import("std");
 const main = @import("main");
 const command = main.server.command;
 const Source = command.Source;
+const ashutil = @import("ashutil.zig");
 
 pub const description = "Decline a pending teleport request.";
 pub const usage = "/tpdeny";
@@ -24,6 +25,15 @@ pub fn execute(args: Args, source: Source) void {
 		source.sendMessage("#e6312cYou have no pending teleport requests.", .{});
 		return;
 	};
+
+	if (ashutil.nowSeconds() - prof.tpa_request_time > main.server.Entity.teleportRequestTimeoutSeconds) {
+		prof.tpa_request_from = null;
+		source.sendMessage("#e6312cThat teleport request has already expired.", .{});
+		if (main.server.getUserByIndex(senderIndex)) |sender| {
+			sender.sendMessage("#e6312cYour teleport request expired.", .{});
+		}
+		return;
+	}
 
 	prof.tpa_request_from = null;
 

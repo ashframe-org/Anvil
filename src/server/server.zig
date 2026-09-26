@@ -32,6 +32,18 @@ pub const permission = @import("permission.zig");
 pub const players = @import("players.zig");
 pub const BlockDrop = @import("BlockDrop.zig");
 pub const emojis = @import("emojis.zig");
+pub const titles = @import("titles.zig");
+pub const progress = @import("progress.zig");
+pub const claims = @import("claims.zig");
+pub const veterans = @import("veterans.zig");
+pub const waypoints = @import("waypoints.zig");
+pub const chatfilter = @import("chatfilter.zig");
+pub const shrines = @import("shrines.zig");
+pub const shops = @import("shops.zig");
+pub const anticheat = @import("anticheat.zig");
+pub const report = @import("report.zig");
+pub const metrics = @import("metrics.zig");
+pub const alliances = @import("alliances.zig");
 
 pub const command = @import("command.zig");
 
@@ -102,6 +114,77 @@ pub const WorldEditData = struct {
 
 pub const PlayerIndex = usize;
 
+/// Maps a player's observed speed to an effective render distance (in chunks):
+/// the full client value at/below `dynamicRdFullSpeed`, shrinking linearly to
+/// `dynamicRdMinChunks` at `dynamicRdMinSpeed`. Local players and staff keep the
+/// full distance. This is what keeps fast movers (falls, hyperspeed) from
+/// saturating chunk generation/streaming.
+fn dynamicRenderDistanceFor(user: *User) u16 {
+	const clientRD = user.renderDistance;
+	if (!main.settings.launchConfig.dynamicRenderDistance) return clientRD;
+	// Applies to everyone, including the singleplayer host and staff: both still
+	// pay for chunk generation (in singleplayer it shares the CPU with the
+	// client), and exempting them meant the feature never engaged while testing.
+	const now = anticheat.nowMilliseconds();
+	var rd: u16 = clientRD;
+
+	// 1. Velocity: how fast the player is actually covering ground.
+	if (clientRD > User.dynamicRdMinChunks) {
+		const speed = user.observedSpeed;
+		if (speed > User.dynamicRdFullSpeed) {
+			const t = @min(1.0, (speed - User.dynamicRdFullSpeed)/(User.dynamicRdMinSpeed - User.dynamicRdFullSpeed));
+			const minRD: f64 = @floatFromInt(User.dynamicRdMinChunks);
+			const fullRD: f64 = @floatFromInt(clientRD);
+			rd = @min(rd, @as(u16, @intFromFloat(@max(minRD, fullRD - t*(fullRD - minRD)))));
+		}
+	}
+
+	// 2. Teleport ramp: a short low-distance window after any teleport.
+	rd = @min(rd, user.teleportRampRD(now));
+
+	// 3. Server load: one global cap derived from real server pressure, so a
+	//    teleport burst or many fast players can't overload it (velocity alone
+	//    can't see that, e.g. a stationary player after a teleport).
+	const loadCap = main.server.metrics.loadRenderDistance.load(.monotonic);
+	if (loadCap != 0) rd = @min(rd, loadCap);
+
+	// Absolute floor: always keep the immediate area.
+	return @min(clientRD, @max(rd, User.dynamicRdAbsFloor));
+}
+
+// --- ASHFRAME CUSTOM (default command permissions) ---
+// Upstream's "default" group grants /command/avatar and /command/help, so only
+// our custom commands need explicit grants here. Runs on every join (see
+// initPlayer): permissions persist per player, so first-join-only grants would
+// never reach existing players when the list changes.
+fn ensureDefaultCommandPermissions(id: main.entity.Entity) void {
+	const perms = main.entity.components.@"cubyz:permissions".server;
+	const defaults = [_][]const u8{
+		"/command/home", "/command/sethome", "/command/delhome", "/command/homes",
+		"/command/waypoint", "/command/tpa", "/command/tpaccept", "/command/back",
+		"/command/players", "/command/playtime", "/command/stats", "/command/afk", "/command/tpdeny",
+		"/command/msg", "/command/alliance", "/command/claim", "/command/eat",
+		"/command/titles", "/command/title", "/command/shop",
+		// Note: "/command/veteran" is granted so admins can invoke it, but the
+		// command additionally gates on "/ashframe/admin/veteran" (NOT granted
+		// by default), same pattern as /prefix and /spawn.
+		"/command/veteran",
+		// Note: "/command/spawn" is granted so players can teleport to spawn,
+		// but spawn.zig gates setting spawn points / moving world spawn behind
+		// "/ashframe/admin/spawn", which is NOT granted by default.
+		"/command/spawn",
+	};
+	for (defaults) |path| perms.addPermission(id, .white, path);
+	// "/command/prefix" is NOT a default: prefix.zig gates everything behind
+	// "/ashframe/admin/prefix", so the command grant alone only exposes it in
+	// /help and then denies inside. Strip it unless the player was explicitly
+	// given prefix powers (in which case /perm put it there deliberately).
+	if (!perms.hasPermission(id, "/ashframe/admin/prefix")) {
+		_ = perms.removePermission(id, .white, "/command/prefix");
+	}
+}
+// --- ASHFRAME CUSTOM (default command permissions) ---
+
 pub const User = struct { // MARK: User
 	const maxSimulationDistance = 8;
 	const simulationSize = 2*maxSimulationDistance;
@@ -113,7 +196,10 @@ pub const User = struct { // MARK: User
 	lastTime: i16 = undefined,
 	lastSaveTime: std.Io.Timestamp = .fromNanoseconds(0),
 	name: []const u8 = "",
-	renderDistance: u16 = undefined,
+	// Default matches the client default; replaced by the client's real value on
+	// the first chunk request. A defined default matters now that the dynamic
+	// render distance reads this from `checkMovement` before any request.
+	renderDistance: u16 = 12,
 	clientUpdatePos: Vec3i = .{0, 0, 0},
 	receivedFirstEntityData: bool = false,
 	isLocal: bool = false,
@@ -143,17 +229,256 @@ pub const User = struct { // MARK: User
 	handInventory: ?InventoryId = null,
 
 	connected: Atomic(bool) = .init(true),
+	/// `pause()` destroys inventories and deinits the id map, so it MUST only run
+	/// once. It can be reached from `deferredPauseAndDeinit` and again from
+	/// `connectionManager.pause() -> Connection.pause() -> User.pause()`, which
+	/// double-freed everything on shutdown.
+	paused: bool = false,
 	state: State = .awaitingKeyVerification,
 
 	mutex: main.utils.Mutex = .{},
 
 	inventoryCommands: main.List([]const u8) = .empty,
 
+	// --- ASHFRAME CUSTOM (Anticheat) ---
+	anticheatLastPos: ?[3]f64 = null,
+	anticheatLastTime: i64 = 0,
+	teleportGraceUntil: i64 = 0,
+	// Cached on the server thread (permissions can't be read off-thread).
+	anticheatStaff: bool = false,
+	rateChat: anticheat.TokenBucket = .{.capacity = 12, .refillPerSec = 6},
+	rateCommand: anticheat.TokenBucket = .{.capacity = 20, .refillPerSec = 10},
+	rateInventory: anticheat.TokenBucket = .{.capacity = 120, .refillPerSec = 60},
+	/// Per-category mute timestamps for high-frequency anticheat logging, so a
+	/// fast player can't generate 20 notes/second (each a log + allocations +
+	/// O(n) report bookkeeping) and stall the tick.
+	noteMuteUntilMs: [std.meta.fields(anticheat.Category).len]i64 = @splat(0),
+	// --- ASHFRAME CUSTOM (Anticheat) ---
+
+	// --- ASHFRAME CUSTOM (Dynamic render distance) ---
+	/// Latest observed speed (blocks/s), measured on the network thread in
+	/// `checkMovement`. Drives the dynamic render distance.
+	observedSpeed: f64 = 0,
+	/// Teleport view ramp window (set by `beginTeleportViewRamp`).
+	teleportRampStartMs: i64 = 0,
+	teleportRampUntil: i64 = 0,
+	/// Effective render distance currently allowed for this player, in chunks.
+	/// Read from worker threads (`ChunkLoadTask.isStillNeeded`), hence atomic.
+	/// 0 means "not computed yet" (treat as the client's full render distance).
+	dynamicRenderDistance: std.atomic.Value(u16) = .init(0),
+	/// Chunk requests held back because they were outside `dynamicRenderDistance`
+	/// while the player was moving fast. Re-queued when they slow down again, so
+	/// this never permanently withholds a chunk the client is still waiting for.
+	deferredChunks: main.List(main.chunk.ChunkPosition) = .empty,
+	/// Ticks counter used to run the (potentially O(n)) held-chunk pass less often.
+	deferredTick: u8 = 0,
+	/// Whether this player should get chat feedback when the dynamic render
+	/// distance changes (cached on the server thread; operators get it).
+	perfDebug: bool = false,
+	lastSentEffectiveRD: u16 = 0,
+	lastViewDebugMs: i64 = 0,
+	// --- ASHFRAME CUSTOM (Dynamic render distance) ---
+
 	pub const State = enum { awaitingKeyVerification, connectedVerified, awaitingReloadVerified };
+
+	// --- ASHFRAME CUSTOM (Dynamic render distance tunables) ---
+	/// Never shrink the effective render distance below this many chunks.
+	pub const dynamicRdMinChunks: u16 = 10;
+	/// No shrinking at or below this speed (blocks/s). Above creative fly (32),
+	/// so walking/sprinting/creative flight are never affected.
+	pub const dynamicRdFullSpeed: f64 = 40;
+	/// Speed at which the minimum render distance is reached. Covers terminal
+	/// falls (~90) and hyperspeed/ghost (~128).
+	pub const dynamicRdMinSpeed: f64 = 128;
+	/// Per-player cap on held-back requests. Kept high so it is never the thing
+	/// that silently drops a leading-edge request the client is waiting for.
+	pub const maxDeferredChunks: usize = 32768;
+	/// Held-back requests promoted into the queue per tick. Rate-limiting the
+	/// drain means a big backlog comes back smoothly instead of spiking the queue
+	/// (which used to trick the load cap into collapsing again).
+	pub const maxPromotionsPerTick: usize = 64;
+	/// Absolute floor: the immediate area is always served, even under load or
+	/// right after a teleport (the velocity term has its own, higher, floor).
+	pub const dynamicRdAbsFloor: u16 = 4;
+	/// Teleport view ramp: start low and expand to the client's own distance,
+	/// giving the server time to generate the destination before it expands.
+	pub const teleportRampFromRD: u16 = 5;
+	pub const teleportRampDurationMs: i64 = 3000;
+	// --- ASHFRAME CUSTOM (Dynamic render distance tunables) ---
 
 	pub fn player(self: *User) *Entity {
 		return &self.innerPlayer;
 	}
+
+	/// Starts the teleport view ramp. Called from the single teleport choke point
+	/// (`genericUpdate.sendTPCoordinates`), so every teleport - command or block -
+	/// is covered without the client having to say anything.
+	pub fn beginTeleportViewRamp(self: *User) void {
+		const now = anticheat.nowMilliseconds();
+		self.teleportRampStartMs = now;
+		self.teleportRampUntil = now + teleportRampDurationMs;
+	}
+
+	/// The player's current server-side block position. Used for every
+	/// "is this chunk still wanted?" decision instead of `clientUpdatePos`, which
+	/// stops updating whenever the client stops sending chunk requests (e.g. while
+	/// it is stalled) and would then point at the wrong place entirely.
+	pub fn livePosBlock(self: *User) Vec3i {
+		const pos = self.player().pos;
+		return .{
+			anticheat.toI32(pos[0]) orelse 0,
+			anticheat.toI32(pos[1]) orelse 0,
+			anticheat.toI32(pos[2]) orelse 0,
+		};
+	}
+
+	/// Extra chunks of slack added to every keep/drop radius, sized so a
+	/// high-latency client's (legitimately) further-ahead view is honoured and a
+	/// low-latency client is unaffected.
+	pub fn latencyKeepMarginChunks(self: *User) f64 {
+		const base: f64 = 2.0;
+		const conn = self.conn;
+		if (!conn.hasRttEstimate) return base;
+		const rttMs = (@as(f64, conn.rttEstimate) + @as(f64, conn.rttUncertainty))/1000.0;
+		const speed = @max(self.observedSpeed, 4.0);
+		const blocksAhead = (rttMs/1000.0)*speed;
+		const chunks = blocksAhead/@as(f64, @floatFromInt(main.chunk.chunkSize));
+		return base + @min(chunks, 2.0);
+	}
+
+	/// How far (in blocks) a chunk of `voxelSize` may be from the player and still
+	/// be considered as still wanted. Never depends on the throttled effective
+	/// distance, so throttling can only delay delivery, never drop a request.
+	pub fn keepRadiusBlocks(self: *User, voxelSize: u31) f64 {
+		const margin = self.latencyKeepMarginChunks();
+		return (@as(f64, @floatFromInt(self.renderDistance)) + margin) *
+			@as(f64, @floatFromInt(main.chunk.chunkSize)) *
+			@as(f64, @floatFromInt(voxelSize));
+	}
+
+	/// Effective distance forced by an active teleport ramp: starts at
+	/// `teleportRampFromRD` and expands linearly to the client's distance.
+	fn teleportRampRD(self: *User, now: i64) u16 {
+		if (now >= self.teleportRampUntil) return self.renderDistance;
+		const span = @as(f64, @floatFromInt(self.teleportRampUntil - self.teleportRampStartMs));
+		const elapsed = @as(f64, @floatFromInt(now - self.teleportRampStartMs));
+		const t = if (span > 0) @min(1.0, @max(0.0, elapsed/span)) else 1.0;
+		const from = @as(f64, @floatFromInt(teleportRampFromRD));
+		const to = @as(f64, @floatFromInt(self.renderDistance));
+		return @intFromFloat(@max(0.0, from + t*(to - from)));
+	}
+
+	/// Recomputes and stores this player's effective render distance from their
+	/// speed. Network thread only (`user.renderDistance`/`observedSpeed` live there).
+	pub fn refreshDynamicRenderDistance(self: *User) void {
+		self.dynamicRenderDistance.store(dynamicRenderDistanceFor(self), .monotonic);
+	}
+
+	/// Holds back a chunk request that is outside the current effective render
+	/// distance. Bounded, so a flood can't grow it without limit.
+	pub fn deferChunk(self: *User, pos: main.chunk.ChunkPosition) void {
+		self.mutex.lock();
+		defer self.mutex.unlock();
+		if (self.deferredChunks.items.len >= maxDeferredChunks) return;
+		self.deferredChunks.append(main.globalAllocator, pos);
+	}
+
+	/// Server thread: re-queue held-back requests that are now within range, and
+	/// drop ones the client has since moved past. Never runs while holding
+	/// `self.mutex` (queueing locks it). Promotes only, so it can never stall
+	/// streaming the way a dropping cap did.
+	pub fn processDeferredChunks(self: *User) void {
+		self.mutex.lock();
+		if (self.deferredChunks.items.len == 0) {
+			self.mutex.unlock();
+			return;
+		}
+		const pending = self.deferredChunks;
+		self.deferredChunks = .empty;
+		self.mutex.unlock();
+		defer pending.deinit(main.globalAllocator);
+
+		const effRaw = self.dynamicRenderDistance.load(.monotonic);
+		const eff = if (effRaw == 0) self.renderDistance else effRaw;
+		// Fresh position, NOT `clientUpdatePos` (which freezes when the client is
+		// stalled, causing exactly the chunks around the player to be discarded).
+		const pos = self.livePosBlock();
+		const chunkSizeF = @as(f64, @floatFromInt(main.chunk.chunkSize));
+		var budget: usize = maxPromotionsPerTick;
+		var keep: main.List(main.chunk.ChunkPosition) = .empty;
+		defer keep.deinit(main.globalAllocator);
+		for (pending.items) |req| {
+			const minDist = @as(f64, @floatFromInt(req.getMinDistanceSquared(pos)));
+			const voxelSize = @as(f64, @floatFromInt(req.voxelSize));
+			// Promote when inside the throttled distance (+1 chunk slack).
+			const effRadius = (@as(f64, @floatFromInt(eff)) + 1.0)*chunkSizeF*voxelSize;
+			if (minDist <= effRadius*effRadius) {
+				if (budget > 0) {
+					budget -= 1;
+					if (main.server.world) |serverWorld| serverWorld.queueChunk(req, self);
+					continue; // queued -> no longer held
+				}
+				// Over this tick's budget: keep for the next tick.
+			}
+			// Keep anything the client could still want (its own distance +
+			// latency margin). Only genuinely passed chunks are discarded.
+			const keepRadius = self.keepRadiusBlocks(req.voxelSize);
+			if (minDist <= keepRadius*keepRadius) {
+				keep.append(main.globalAllocator, req);
+			} else {
+				metrics.noteHeldDiscarded();
+			}
+		}
+		self.requeueDeferred(keep.items);
+	}
+
+	/// Server thread: if this player is an operator and their effective render
+	/// distance changed, tell them (chat + log), throttled. `lastSentEffectiveRD
+	/// == 0` is the "not yet reported" sentinel, so the first value is silent.
+	fn maybeSendViewDebugMessage(self: *User) void {
+		if (!self.perfDebug) return;
+		const eff = self.dynamicRenderDistance.load(.monotonic);
+		if (eff == 0) return;
+		if (self.lastSentEffectiveRD == 0) {
+			self.lastSentEffectiveRD = eff;
+			return;
+		}
+		const capped = eff < self.renderDistance;
+		const changed = eff != self.lastSentEffectiveRD;
+		const now = anticheat.nowMilliseconds();
+		const speed = self.observedSpeed;
+		if (changed) {
+			if (now - self.lastViewDebugMs < 500) return;
+		} else {
+			// Heartbeat every 10 s while capped, so a steady cap is still visible.
+			if (!capped or now - self.lastViewDebugMs < 10000) return;
+		}
+		self.lastViewDebugMs = now;
+		const prev = self.lastSentEffectiveRD;
+		self.lastSentEffectiveRD = eff;
+		if (!changed) {
+			self.sendMessage("#8a8a8a[perf] view #cfcfcf{d}/{d} chunks #8a8a8a· speed #cfcfcf{d:.0} b/s", .{ eff, self.renderDistance, speed });
+		} else if (capped) {
+			self.sendMessage("#8a8a8a[perf] view #cfcfcf{d} #8a8a8a→ #e6312c{d} chunks #cfcfcf(speed {d:.0} b/s; full ≤{d:.0}, min {d})", .{
+				self.renderDistance, eff, speed, dynamicRdFullSpeed, dynamicRdMinChunks,
+			});
+		} else {
+			self.sendMessage("#8a8a8a[perf] view #e6312c{d} #8a8a8a→ #00ff00{d} chunks #cfcfcf(speed {d:.0} b/s)", .{
+				prev, eff, speed,
+			});
+		}
+		std.log.info("[perf] {s} view {d} (client {d}), speed {d:.0} b/s", .{ self.name, eff, self.renderDistance, speed });
+	}
+
+	fn requeueDeferred(self: *User, chunks: []const main.chunk.ChunkPosition) void {
+		self.mutex.lock();
+		defer self.mutex.unlock();
+		for (chunks) |req| {
+			if (self.deferredChunks.items.len >= maxDeferredChunks) break;
+			self.deferredChunks.append(main.globalAllocator, req);
+		}
+	}
+
 
 	pub fn init(manager: *ConnectionManager, ipPort: []const u8) !*User {
 		const self = main.globalAllocator.create(User);
@@ -179,6 +504,8 @@ pub const User = struct { // MARK: User
 		};
 	}
 	fn privateDeinit(self: *User) void {
+		// Make sure this user can never be sent to after its connection is freed.
+		forceRemoveFromUserList(self);
 		self.conn.deinit();
 		main.globalAllocator.free(self.name);
 		if (self.newKeyString) |str| main.globalAllocator.free(str);
@@ -186,17 +513,18 @@ pub const User = struct { // MARK: User
 	}
 	pub fn deferredPauseAndDeinit(self: *User) void {
 		self.conn.disconnect();
-		if (self.inventory != null) {
-			world.?.savePlayer(self) catch |err| {
-				std.log.err("Failed to save player: {s}", .{@errorName(err)});
-				return;
-			};
-		}
-
+		// Tear down synchronously while the server thread and world are alive.
+		// Deferring `pause` through the GC ran it after the world was destroyed
+		// (and after this user's memory was freed), which crashed teardown with
+		// an inventory assert. `pause` saves the player, so no separate save here.
+		self.pause();
 		main.heap.GarbageCollection.deferredFree(.{.ptr = self, .freeFunction = main.meta.castFunctionSelfToAnyopaque(privateDeinit)});
-		main.heap.GarbageCollection.deferredFree(.{.ptr = self, .freeFunction = main.meta.castFunctionSelfToAnyopaque(pause)});
 	}
 	pub fn pause(self: *User) void {
+		// Idempotent: teardown frees inventories/maps, so a second call (e.g. via
+		// `Connection.pause` during server shutdown) must be a no-op.
+		if (self.paused) return;
+		self.paused = true;
 		self.state = switch (self.state) {
 			.awaitingKeyVerification => .awaitingKeyVerification,
 			.connectedVerified => .awaitingReloadVerified,
@@ -206,7 +534,9 @@ pub const User = struct { // MARK: User
 		self.clearJobQueue();
 
 		main.items.Inventory.server.disconnectUser(self);
-		std.debug.assert(self.inventoryClientToServerIdMap.count() == 0); // leak
+		if (self.inventoryClientToServerIdMap.count() != 0) {
+			std.log.err("Inventory map leak on disconnect: {d} entries.", .{self.inventoryClientToServerIdMap.count()});
+		}
 		self.inventoryClientToServerIdMap.deinit();
 
 		if (self.inventory != null) {
@@ -230,6 +560,7 @@ pub const User = struct { // MARK: User
 			main.globalAllocator.free(commandData);
 		}
 		self.inventoryCommands.deinit(main.globalAllocator);
+		self.deferredChunks.deinit(main.globalAllocator);
 
 		self.jobQueue.deinit();
 	}
@@ -266,6 +597,8 @@ pub const User = struct { // MARK: User
 				const nameEntry = main.stackAllocator.print("name:{s}", .{name});
 				defer main.stackAllocator.free(nameEntry);
 				if (main.server.players.lookupIndex(nameEntry)) |lookup| {
+					// Legacy name-only record: logged so operators can see if it's abused.
+					main.server.anticheat.note(self, .protocol, "adopted a name-only (legacy) player record");
 					self.playerIndex = lookup.playerIndex;
 					allowedToJoin = !lookup.blocked;
 				} else {
@@ -311,31 +644,22 @@ pub const User = struct { // MARK: User
 		}
 		if (main.entity.components.@"cubyz:permissions".server.get(self.id) == null) {
 			main.entity.components.@"cubyz:permissions".server.loadEmpty(self.id);
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/avatar");
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/help");
-
-			// --- ASHFRAME CUSTOM (default command permissions) ---
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/home");
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/tpa");
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/tpaccept");
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/back");
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/players");
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/playtime");
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/afk");
-			// Note: "/command/prefix" is granted so players can invoke the command, but prefix.zig
-			// additionally gates the actual add/remove behaviour behind "/command/prefix/admin",
-			// which is NOT granted by default - an operator must grant it explicitly via /perm.
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/prefix");
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/tpdeny");
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/msg");
-			// Note: "/command/spawn" is granted so players can teleport to spawn, but
-			// spawn.zig gates setting spawn points / moving world spawn behind
-			// "/command/spawn/admin", which is NOT granted by default.
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/spawn");
-			// --- ASHFRAME CUSTOM (default command permissions) ---
 		}
+		// --- ASHFRAME CUSTOM (default command permissions) ---
+		// Runs on EVERY join, not just the first: permissions persist per
+		// player, so a grant added later (e.g. /command/alliance) would
+		// otherwise never reach existing players. addPermission is a map put
+		// (idempotent); groups, the operator wildcard and /ashframe/admin/*
+		// paths are never touched here.
+		ensureDefaultCommandPermissions(self.id);
+		// --- ASHFRAME CUSTOM (default command permissions) ---
+		main.entity.components.@"cubyz:permissions".server.addToGroup(self.id, permission.Group.default);
+
 		if (self.isLocal) {
-			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/");
+			main.entity.components.@"cubyz:permissions".server.addToGroup(self.id, permission.Group.moderator);
+			if (world.?.settings.allowCheats) {
+				main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/");
+			}
 		}
 
 		self.interpolation.init(@ptrCast(&self.player().pos), @ptrCast(&self.player().vel));
@@ -435,6 +759,7 @@ pub const User = struct { // MARK: User
 						while (user.jobQueue.extractAny()) |_task| {
 							var task = _task;
 							if (!task.vtable.isStillNeeded(task.self)) {
+								if (task.vtable.taskType == .chunkgen) metrics.noteChunkTaskDropped();
 								task.vtable.clean(task.self);
 								continue;
 							}
@@ -519,6 +844,14 @@ pub const User = struct { // MARK: User
 		self.inventoryCommands = .empty;
 		self.mutex.unlock();
 
+		// --- ASHFRAME CUSTOM (Dynamic render distance): re-queue held-back requests ---
+		// The held list is empty in normal play; only run the (O(n)) pass every
+		// other tick so it can't dominate the tick during throttling.
+		self.deferredTick +%= 1;
+		if (self.deferredTick % 2 == 0) self.processDeferredChunks();
+		self.maybeSendViewDebugMessage();
+		// --- ASHFRAME CUSTOM (Dynamic render distance) ---
+
 		for (commands.items) |commandData| {
 			defer main.globalAllocator.free(commandData);
 			var reader: BinaryReader = .init(commandData);
@@ -554,6 +887,8 @@ pub const User = struct { // MARK: User
 	pub fn receiveCommand(self: *User, commandData: []const u8) void {
 		self.mutex.lock();
 		defer self.mutex.unlock();
+		// Cap the queue so a flood can't grow it without bound before the tick.
+		if (self.inventoryCommands.items.len >= 256) return;
 		self.inventoryCommands.append(main.globalAllocator, main.globalAllocator.dupe(u8, commandData));
 	}
 
@@ -563,6 +898,15 @@ pub const User = struct { // MARK: User
 		const position: [3]f64 = try reader.readVec(Vec3d);
 		const velocity: [3]f64 = try reader.readVec(Vec3d);
 		const rotation: [3]f32 = try reader.readVec(Vec3f);
+		// A legitimate client never sends NaN/Inf or absurd coordinates; reject
+		// (which disconnects) rather than letting them reach gameplay logic.
+		if (!main.server.anticheat.validPosition(position) or !main.server.anticheat.validVelocity(velocity) or !main.server.anticheat.validRotation(rotation)) {
+			main.server.report.recordKick(self.name, "malformed position");
+			return error.Invalid;
+		}
+		// Wave 1 logs implausible speed; wave 2 drops the update (keeping the
+		// last valid position) rather than disconnecting.
+		if (!main.server.anticheat.checkMovement(self, position, velocity)) return;
 		self.player().rot = rotation;
 		const time = try reader.readInt(i16);
 		self.timeDifference.addDataPoint(time);
@@ -603,7 +947,32 @@ var restart: bool = true;
 
 var lastTime: std.Io.Timestamp = undefined;
 
-pub var thread: ?std.Thread = null;
+// Tick-work overrun detection: single slow ticks are harmless, so only warn when
+// the tick is persistently over budget, and at most once per 10 s.
+const tickBudgetMs: f32 = 50.0;
+var lagWindow: [10]bool = @splat(false);
+var lagWindowIndex: usize = 0;
+var lagWarnLastMs: i64 = 0;
+
+fn reportTickWork(workMs: f32) void {
+	main.server.metrics.noteTickWork(workMs);
+	const overBudget = workMs >= tickBudgetMs;
+	lagWindow[lagWindowIndex] = overBudget;
+	lagWindowIndex = (lagWindowIndex + 1)%lagWindow.len;
+	if (!overBudget) return;
+	var overCount: usize = 0;
+	for (lagWindow) |b| {
+		if (b) overCount += 1;
+	}
+	// Only when it's persistent, not a one-off hiccup.
+	if (overCount < 3) return;
+	const now = main.server.anticheat.nowMilliseconds();
+	if (now - lagWarnLastMs < 10_000) return;
+	lagWarnLastMs = now;
+	std.log.warn("Server tick over budget: this tick {d:.1} ms, {d}/{d} recent ticks over {d:.0} ms", .{ workMs, overCount, lagWindow.len, tickBudgetMs });
+}
+
+var thread: ?std.Thread = null;
 
 fn init(name: []const u8, singlePlayerPort: ?u16, mode: ServerWorld.Mode) void { // MARK: init()
 	main.heap.allocators.createWorldArena();
@@ -627,6 +996,8 @@ fn init(name: []const u8, singlePlayerPort: ?u16, mode: ServerWorld.Mode) void {
 		@panic("Can't generate world.");
 	};
 
+
+
 	connectionManager.@"continue"() catch |err| {
 		std.log.err("Couldn't create thread: {s}", .{@errorName(err)});
 		@panic("Could not open Server.");
@@ -641,6 +1012,7 @@ fn init(name: []const u8, singlePlayerPort: ?u16, mode: ServerWorld.Mode) void {
 		user.isLocal = true;
 	}
 }
+
 
 fn deinit() void {
 	main.threadPool.pause();
@@ -694,6 +1066,9 @@ fn getInitialEntityList(allocator: main.heap.NeverFailingAllocator) []const u8 {
 
 fn update() void { // MARK: update()
 	world.?.update();
+	// Deliver any notifications queued from the network thread (needs the
+	// server thread for permission checks).
+	report.flushNotifications();
 	main.systems.server.update();
 	stdin_handler.update();
 
@@ -706,6 +1081,30 @@ fn update() void { // MARK: update()
 	for (userList) |user| {
 		user.update();
 	}
+
+
+	// --- ASHFRAME CUSTOM (Deferred chat-filter bans) ---
+	// Applied here so the message/save/disconnect happen on the server thread.
+	for (userList) |user| {
+		if (!user.player().pendingBan) continue;
+		user.player().pendingBan = false;
+		user.sendMessage("#e6312cYou have been banned (3 strikes).", .{});
+		chatfilter.saveCurrentWorld();
+		user.conn.disconnect();
+	}
+	// --- ASHFRAME CUSTOM (Deferred chat-filter bans) ---
+
+	// --- ASHFRAME CUSTOM (Deferred anticheat kicks) ---
+	// Repeat speeders are flagged on the network thread; the kick itself
+	// (message + disconnect) happens here on the server thread.
+	for (userList) |user| {
+		if (!user.player().pendingKick) continue;
+		user.player().pendingKick = false;
+		user.sendMessage("#e6312cKicked for repeated impossible movement.", .{});
+		report.recordKick(user.name, "repeat speeder");
+		user.conn.disconnect();
+	}
+	// --- ASHFRAME CUSTOM (Deferred anticheat kicks) ---
 
 	// Send the entity data:
 	const itemData = world.?.itemDropManager.getPositionAndVelocityData(main.stackAllocator);
@@ -741,7 +1140,17 @@ fn update() void { // MARK: update()
 	}
 }
 
-pub fn startFromNewThread(name: []const u8, port: ?u16, mode: ServerWorld.Mode) void {
+pub fn startAndCreateThread(name: []const u8, port: u16, mode: ServerWorld.Mode) void {
+	thread = std.Thread.spawn(.{}, main.server.startFromNewThread, .{name, port, mode}) catch |err| {
+		std.log.err("Encountered error while starting server thread: {s}", .{@errorName(err)});
+		return;
+	};
+	thread.?.setName(main.io, "Server") catch |err| {
+		std.log.err("Failed to rename Server thread: {s}", .{@errorName(err)});
+	};
+}
+
+fn startFromNewThread(name: []const u8, port: u16, mode: ServerWorld.Mode) void {
 	main.initThreadLocals();
 	defer main.deinitThreadLocals();
 	startFromExistingThread(name, port, mode);
@@ -787,20 +1196,27 @@ pub fn startFromExistingThread(name: []const u8, port: ?u16, mode: ServerWorld.M
 				main.io.sleep(newTime.durationTo(lastTime.addDuration(updateTime)), .awake) catch {};
 				lastTime = lastTime.addDuration(updateTime);
 			} else {
-				std.log.warn("The server is lagging behind by {d:.1} ms", .{@as(f32, @floatFromInt(newTime.nanoseconds -% lastTime.nanoseconds -% updateTime.nanoseconds))/1000000.0});
+				// Fell behind schedule. Usually just OS sleep overshoot, so this is
+				// not warned about here; `reportTickWork` tracks real over-budget
+				// ticks (the tick work, not the schedule delta).
 				lastTime = newTime;
 			}
+			const workStart = main.timestamp();
 			update();
+			reportTickWork(@as(f32, @floatFromInt(workStart.durationTo(main.timestamp()).toNanoseconds()))/1_000_000.0);
 		}
 	}
 }
 
-pub const StopType = enum { stop, restart };
-pub fn stop(_restart: StopType) void {
-	if (_restart == .restart) {
+pub const StopType = enum { stop, stopAndWait, restart };
+pub fn stop(typ: StopType) void {
+	if (typ == .restart) {
 		restart = true;
 	}
 	running.store(false, .release);
+	if (typ == .stopAndWait) {
+		if (thread) |t| t.join();
+	}
 }
 
 pub fn disconnect(user: *User) void { // MARK: disconnect()
@@ -840,12 +1256,48 @@ pub fn removePlayer(user: *User) void { // MARK: removePlayer()
 	}
 }
 
+/// Removes `user` from the live user list regardless of its `connected` flag.
+/// Called during teardown so a freed connection can't be referenced by a later
+/// broadcast (which crashed with a stale `Connection`).
+fn forceRemoveFromUserList(user: *User) void {
+	userMutex.lock();
+	defer userMutex.unlock();
+	for (users.items, 0..) |other, i| {
+		if (other == user) {
+			_ = users.swapRemove(i);
+			std.log.warn("[ashframe] privateDeinit: force-removed a still-listed user from the users list", .{});
+			break;
+		}
+	}
+}
+
 pub fn connect(user: *User) void {
 	userConnectList.pushBack(user);
 }
 
 pub fn connectInternal(user: *User) void {
+	// --- ASHFRAME CUSTOM (Ban check) ---
+	// NB: do NOT send chat here. The handshake is not complete yet, and sending a
+	// chat message pre-handshake crashed `Connection.send`. The client just sees
+	// the generic disconnect (custom reasons would need a fork client).
+	if (chatfilter.isBanned(user.name, user.newKeyString)) {
+		std.log.info("[ashframe] banned player {s} tried to join; disconnected", .{user.name});
+		user.conn.disconnect();
+		return;
+	}
+	if (chatfilter.findBad(user.name) != null) {
+		std.log.info("[ashframe] player with a disallowed name tried to join; disconnected", .{});
+		user.conn.disconnect();
+		return;
+	}
+	// --- ASHFRAME CUSTOM (Ban check) ---
+
 	user.initPlayer();
+	// Cache staff status on the server thread: the movement check runs on the
+	// network thread, where `hasPermission` may not be called.
+	user.anticheatStaff = main.entity.components.@"cubyz:permissions".server.hasPermission(user.id, report.permissionPath);
+	// Operators also get chat feedback when their dynamic render distance changes.
+	user.perfDebug = user.anticheatStaff;
 	main.network.protocols.handShake.sendServerPlayerData(user.conn);
 	user.conn.handShakeState.store(.complete, .monotonic);
 
@@ -867,6 +1319,8 @@ pub fn connectInternal(user: *User) void {
 		defer zonArray.deinit(main.stackAllocator);
 
 		const entityZon = user.player().save(main.stackAllocator, .playerNearby);
+		var nameBuf: [256]u8 = undefined;
+		if (titles.decoratedNameBuf(&nameBuf, user)) |decorated| entityZon.put("name", decorated);
 		zonArray.array.append(entityZon);
 		const data = zonArray.toStringEfficient(main.stackAllocator, &.{});
 		defer main.stackAllocator.free(data);
@@ -879,6 +1333,8 @@ pub fn connectInternal(user: *User) void {
 		defer zonArray.deinit(main.stackAllocator);
 		for (userList) |other| {
 			const entityZon = other.player().save(main.stackAllocator, .playerNearby);
+			var nameBuf: [256]u8 = undefined;
+			if (titles.decoratedNameBuf(&nameBuf, other)) |decorated| entityZon.put("name", decorated);
 			zonArray.array.append(entityZon);
 		}
 		const data = zonArray.toStringEfficient(main.stackAllocator, &.{});
@@ -889,23 +1345,75 @@ pub fn connectInternal(user: *User) void {
 	main.network.protocols.entity.send(user.conn, initialList);
 	main.stackAllocator.free(initialList);
 	sendMessage("{s}§#8a8a8a joined", .{user.name});
+	// --- ASHFRAME CUSTOM (Server report) ---
+	report.recordJoin(user.name);
+	report.maybeShowReport(user);
+	// --- ASHFRAME CUSTOM (Server report) ---
 
 	userMutex.lock();
 	users.append(user);
 	userMutex.unlock();
+
+	// --- ASHFRAME CUSTOM (Titles: distinct-days tracking) ---
+	{
+		const prof = user.player();
+		const today = titles.currentDay();
+		if (prof.last_played_day != today) {
+			prof.days_played +|= 1;
+			prof.last_played_day = today;
+		}
+		titles.check(user);
+		veterans.grant(user);
+	}
+	// --- ASHFRAME CUSTOM (Titles: distinct-days tracking) ---
+}
+
+/// Re-sends this player's entity to everyone else so a changed title is reflected
+/// in the above-head nametag. The decorated name is used only on the network copy,
+/// never on disk or in chat, so the player's real name stays intact.
+pub fn refreshPlayerNametag(user: *User) void {
+	const userList = getUserList(main.stackAllocator);
+	defer main.stackAllocator.free(userList);
+
+	const zonArray = main.ZonElement.initArray(main.stackAllocator);
+	defer zonArray.deinit(main.stackAllocator);
+	zonArray.array.append(.{.int = @intFromEnum(user.id)}); // remove the stale entity
+	const entityZon = user.player().save(main.stackAllocator, .playerNearby);
+	var nameBuf: [256]u8 = undefined;
+	if (titles.decoratedNameBuf(&nameBuf, user)) |decorated| entityZon.put("name", decorated);
+	zonArray.array.append(entityZon); // re-add it with the updated nametag
+
+	const data = zonArray.toStringEfficient(main.stackAllocator, &.{});
+	defer main.stackAllocator.free(data);
+	for (userList) |other| {
+		if (other == user) continue;
+		main.network.protocols.entity.send(other.conn, data);
+	}
 }
 
 pub fn messageFrom(msg: []const u8, source: *User) void { // MARK: message
 	var emoji_buf: [1024]u8 = undefined;
 	const clean_msg = emojis.parseEmojis(msg, &emoji_buf);
 
-	if (source.player().prefix) |pref| {
-		// The prefix text can carry its own §#rrggbb color code (set via /prefix add);
-		// it defaults to the Ashframe red below if the admin didn't include one.
-		sendMessage("§#8a8a8a[§#e6312c{s}§#8a8a8a]§#cfcfcf {s}§#8a8a8a > §#cfcfcf{s}", .{pref, source.name, clean_msg});
-	} else {
-		sendMessage("{s}§#8a8a8a > §#cfcfcf{s}", .{source.name, clean_msg});
+	// --- ASHFRAME CUSTOM (Chat filter) ---
+	if (chatfilter.findBad(clean_msg) != null) {
+		// The ban (message + save + disconnect) is completed on the server thread.
+		_ = chatfilter.strike(source);
+		return;
 	}
+	// --- ASHFRAME CUSTOM (Chat filter) ---
+
+	// --- ASHFRAME CUSTOM (Title tracking) ---
+	source.player().messages_sent +|= 1;
+	titles.check(source);
+
+	var tag: main.ListManaged(u8) = .init(main.stackAllocator);
+	defer tag.deinit();
+	titles.appendChatTag(&tag, source);
+	// The prefix/title tags above can carry their own §#rrggbb color code, so the
+	// name is explicitly reset to the standard light grey after them.
+	sendMessage("{s}§#cfcfcf{s}§#8a8a8a > §#cfcfcf{s}", .{tag.items, source.name, clean_msg});
+	// --- ASHFRAME CUSTOM (Title tracking) ---
 }
 
 fn sendRawMessage(msg: []const u8) void {
@@ -915,6 +1423,11 @@ fn sendRawMessage(msg: []const u8) void {
 	const userList = getUserList(main.stackAllocator);
 	defer main.stackAllocator.free(userList);
 	for (userList) |user| {
+		const state = user.conn.connectionState.load(.monotonic);
+		if (state != .connected) {
+			std.log.warn("[ashframe] sendRawMessage: skipping {s} user={x} conn={x} (state {s})", .{ user.name, @intFromPtr(user), @intFromPtr(user.conn), @tagName(state) });
+			continue;
+		}
 		user.sendRawMessage(msg);
 	}
 }

@@ -20,14 +20,32 @@ pub const tpaccept = @import("tpaccept.zig");
 pub const back = @import("back.zig");
 pub const players = @import("players.zig");
 pub const playtime = @import("playtime.zig");
+pub const stats = @import("stats.zig");
 pub const afk = @import("afk.zig");
 pub const prefix = @import("prefix.zig");
 pub const tpdeny = @import("tpdeny.zig");
 pub const msg = @import("msg.zig");
+pub const claim = @import("claim.zig");
+pub const alliance = @import("alliance.zig");
+pub const sethome = @import("sethome.zig");
+pub const delhome = @import("delhome.zig");
+pub const homes = @import("homes.zig");
+pub const waypoint = @import("waypoint.zig");
+pub const unban = @import("unban.zig");
+pub const ban = @import("ban.zig");
+pub const bans = @import("bans.zig");
+pub const skyscan = @import("skyscan.zig");
+pub const eat = @import("eat.zig");
+pub const titles = @import("titles.zig");
+pub const title = @import("title.zig");
+pub const veteran = @import("veteran.zig");
+pub const shop = @import("shop.zig");
+pub const report = @import("report.zig");
 // --- ASHFRAME CUSTOM (Commands) ---
 
 pub const avatar = @import("entity/avatar.zig");
 
+pub const group = @import("permission/group.zig");
 pub const perm = @import("permission/perm.zig");
 
 pub const undo = @import("worldedit/undo.zig");

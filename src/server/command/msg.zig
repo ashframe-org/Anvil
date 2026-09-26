@@ -30,6 +30,13 @@ pub fn execute(args: Args, source: Source) void {
 		return;
 	}
 
+	// Private messages go through the same slur filter as public chat;
+	// otherwise PMs become a consequence-free channel around the ban system.
+	if (main.server.chatfilter.findBad(params.message.text) != null) {
+		_ = main.server.chatfilter.strike(user);
+		return;
+	}
+
 	source.sendMessage("#8a8a8a[you -> #e6312c{s}#8a8a8a] #cfcfcf{s}", .{target.name, params.message.text});
 	target.sendMessage("#8a8a8a[#e6312c{s}#8a8a8a -> you] #cfcfcf{s}", .{user.name, params.message.text});
 }
