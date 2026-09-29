@@ -264,16 +264,18 @@ pub fn autosave(worldPath: []const u8) void {
 }
 
 // --- Wave-2 enforcement switches (off = log only) ---
-// Reach is enforced: an 8-block radius is far beyond legitimate reach, so a
-// rejection here is unambiguous (and the client is told the real block).
-pub var enforceReach: bool = true;
+// Reach is log-only: the server checks against its own interpolated player
+// position, which lags the client by a frame or more, so legitimate
+// max-reach interactions trip it regularly. Kept as a review signal only.
+pub var enforceReach: bool = false;
 // Movement stays log-only: with no server-side physics, rejecting movement
 // risks rubber-banding legitimate players on a bad connection.
 pub var enforceMovement: bool = false;
 
 /// How far a player may be from a block they interact with. Generous to allow
-/// for interpolation/lag; real reach is ~6 blocks.
-pub const reachRadius: f64 = 8.0;
+/// for interpolation/lag (the server-side position trails the client);
+/// real reach is ~6 blocks.
+pub const reachRadius: f64 = 12.0;
 
 /// Whether `block` (x, z, vertical) is within `radius` of `pos` (x, z, vertical).
 pub fn withinReach(pos: [3]f64, block: [3]i32, radius: f64) bool {
@@ -284,21 +286,23 @@ pub fn withinReach(pos: [3]f64, block: [3]i32, radius: f64) bool {
 }
 
 /// Reach check for a block interaction. Returns true if the action should be
-/// allowed. Out-of-reach is logged (wave 1) and only rejected when
-/// `enforceReach` is enabled (wave 2).
+/// allowed. Out-of-reach is recorded as a review-only suspicion (never
+/// enforced, never operator-paged): the server-side position lags the client,
+/// so legitimate play trips it.
 pub fn checkReach(user: *main.server.User, block: [3]i32) bool {
 	const pos = user.player().pos;
 	if (withinReach(pos, block, reachRadius)) return true;
 	var buf: [160]u8 = undefined;
 	const detail = std.fmt.bufPrint(&buf, "block {d},{d},{d} vs pos {d:.1},{d:.1},{d:.1}", .{ block[0], block[1], block[2], pos[0], pos[1], pos[2] }) catch "out of reach";
-	note(user, .reach, detail);
+	suspect(user, .reach, detail);
 	return !enforceReach;
 }
 
 // --- Movement ---
 // Max legitimate speed: walk 4.5, sprint 8, fly 32, ghost 128, terminal fall 90
-// (physics.zig). Survival threshold covers fall; creative also covers ghost.
-pub const survivalMaxSpeed: f64 = 120.0;
+// (physics.zig). Survival threshold covers fast flight plus a vertical
+// component (128 fly + fall combines to ~160); creative also covers ghost.
+pub const survivalMaxSpeed: f64 = 175.0;
 pub const creativeMaxSpeed: f64 = 200.0;
 /// Staff are given a much higher (but not infinite) threshold so that egregious
 /// cheating by a staff account is still recorded - as a *suspicion*, never
@@ -332,7 +336,11 @@ pub fn checkMovement(user: *main.server.User, pos: [3]f64, vel: [3]f64) bool {
 	var movedSpeed: f64 = 0;
 	if (user.anticheatLastPos) |last| {
 		const dt = @as(f64, @floatFromInt(now - user.anticheatLastTime))/1000.0;
-		if (dt > 0.001) {
+		// Lag-gap guard: position packets arriving faster than the 20 Hz
+		// server tick (or batched after a stall) turn tiny position noise
+		// into huge per-second speeds. Only trust the delta measurement at
+		// sane sample spacing; otherwise fall back to reported velocity.
+		if (dt >= 0.05) {
 			const dx = pos[0] - last[0];
 			const dz = pos[1] - last[1];
 			const dv = pos[2] - last[2];
@@ -343,6 +351,34 @@ pub fn checkMovement(user: *main.server.User, pos: [3]f64, vel: [3]f64) bool {
 	user.anticheatLastPos = .{pos[0], pos[1], pos[2]};
 	user.anticheatLastTime = now;
 	if (user.teleportGraceUntil > now) return true;
+	// --- ASHFRAME CUSTOM (Anticheat: flight pattern, log-only) ---
+	// Ghost/fly/hyperspeed are creative-gated client-side, so a server-side
+	// survival account showing sustained flight-like movement is either a
+	// spoofed client or a desync. Speed alone can't catch it (fly ~32 and
+	// ghost ~128 sit far below the magnitude thresholds), so detect the
+	// *pattern*: fast horizontal travel while not falling, held for seconds.
+	// Log-only suspicion, never enforced: no kick, no reject.
+	if (!user.isLocal and !user.anticheatStaff and user.gamemode.load(.monotonic) != .creative) {
+		const flyHoriz = @sqrt(vel[0]*vel[0] + vel[1]*vel[1]);
+		const flyVert: f64 = vel[2];
+		// Above sprint envelope (~8) with margin, and not in freefall
+		// (terminal fall is ~-90; jumps/falls reset the streak quickly).
+		if (isFlightLike(flyHoriz, flyVert)) {
+			user.flyStreak +|= 1;
+		} else {
+			user.flyStreak = 0;
+		}
+		// ~5 s of continuous flight-likes at 20 Hz. Re-arms after logging.
+		if (user.flyStreak >= 100) {
+			user.flyStreak = 0;
+			var flyBuf: [160]u8 = undefined;
+			const flyDetail = std.fmt.bufPrint(&flyBuf, "sustained flight pattern ({d:.0} horizontal) at {d:.0},{d:.0},{d:.0}", .{ flyHoriz, pos[0], pos[1], pos[2] }) catch "flight pattern";
+			suspect(user, .movement, flyDetail);
+		}
+	} else {
+		user.flyStreak = 0;
+	}
+	// --- ASHFRAME CUSTOM (Anticheat) ---
 	// --- ASHFRAME CUSTOM (Dynamic render distance) ---
 	// Cache the measured *movement* speed (network thread) and refresh the
 	// effective render distance from it. Skipped during teleport grace so server
@@ -351,7 +387,12 @@ pub fn checkMovement(user: *main.server.User, pos: [3]f64, vel: [3]f64) bool {
 	user.refreshDynamicRenderDistance();
 	// --- ASHFRAME CUSTOM (Dynamic render distance) ---
 	const max = maxSpeedFor(user);
+	const prof = user.player();
 	if (observed > max) {
+		// A single over-threshold sample is usually lag, not cheating: only
+		// page the operators after 3 consecutive bad samples.
+		prof.moveViolationStreak +|= 1;
+		if (prof.moveViolationStreak < 3) return !enforceMovement;
 		var buf: [160]u8 = undefined;
 		const detail = std.fmt.bufPrint(&buf, "observed {d:.0}/s (max {d:.0}) at {d:.0},{d:.0},{d:.0}", .{ observed, max, pos[0], pos[1], pos[2] }) catch "speed";
 		if (user.anticheatStaff) {
@@ -366,7 +407,6 @@ pub fn checkMovement(user: *main.server.User, pos: [3]f64, vel: [3]f64) bool {
 			// Runs on the network thread, so only set the flag — the server
 			// thread performs the kick (same pattern as pendingBan).
 			if (!user.isLocal) {
-				const prof = user.player();
 				if (now - prof.moveViolationWindowStart > 60_000) {
 					prof.moveViolationWindowStart = now;
 					prof.moveViolations = 0;
@@ -380,7 +420,39 @@ pub fn checkMovement(user: *main.server.User, pos: [3]f64, vel: [3]f64) bool {
 		}
 		return !enforceMovement;
 	}
+	prof.moveViolationStreak = 0;
 	return true;
+}
+
+// --- ASHFRAME CUSTOM (Anticheat: flight pattern) ---
+// True for movement that looks like sustained flight rather than walking,
+// sprinting, jumping or falling: fast horizontal travel while not in freefall.
+// Ghost/fly/hyperspeed are creative-gated client-side, so a server-side
+// survival account doing this is spoofing (or desynced). Pure: unit-tested.
+pub fn isFlightLike(horizVel: f64, vertVel: f64) bool {
+	return horizVel > 12.0 and vertVel > -5.0;
+}
+
+// --- ASHFRAME CUSTOM (Anticheat: creative-op abuse) ---
+// Windowed counter for gamemode-mismatch abuse: sustained instant-break and
+// creative-only packets sent by a server-side survival account. Same shape as
+// the movement repeat-speeder kick (server thread performs the kick; network
+// code only sets the flag). Runs on the server thread via the command path.
+pub fn noteCreativeOp(user: *main.server.User, detail: []const u8) void {
+	const now = nowMilliseconds();
+	const prof = user.player();
+	if (now - prof.creativeOpWindowStart > 60_000) {
+		prof.creativeOpWindowStart = now;
+		prof.creativeOpViolations = 0;
+	}
+	prof.creativeOpViolations += 1;
+	var buf: [160]u8 = undefined;
+	const full = std.fmt.bufPrint(&buf, "creative-op abuse ({d}/min): {s}", .{ prof.creativeOpViolations, detail }) catch "creative-op abuse";
+	note(user, .protocol, full);
+	if (prof.creativeOpViolations > 10 and !prof.pendingKick and !user.isLocal) {
+		prof.pendingKick = true;
+		note(user, .protocol, "creative-op abuse: kicking");
+	}
 }
 // --- ASHFRAME CUSTOM (Anticheat test harness) ---
 test {

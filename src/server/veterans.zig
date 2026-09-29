@@ -39,7 +39,9 @@ fn isHex6(s: []const u8) bool {
 
 /// Shared name cleaner, also used by the chat filter's ban/unban name
 /// normalisation so both systems agree on what a decorated name strips to.
-/// Strips §#rrggbb and #rrggbb color sequences plus `*`/`~` markdown.
+/// Strips §#rrggbb and #rrggbb color sequences plus `*`/`~` markdown, trims
+/// surrounding whitespace and collapses internal runs (" Sleepy  Evergreen"
+/// and "Sleepy Evergreen" are the same player).
 /// `_` is kept: underscores are legitimate name characters (Kitty_Katster).
 pub fn appendCleaned(out: *main.ListManaged(u8), name: []const u8) void {
 	var i: usize = 0;
@@ -56,8 +58,18 @@ pub fn appendCleaned(out: *main.ListManaged(u8), name: []const u8) void {
 			i += 1;
 			continue;
 		}
-		out.append(name[i]);
+		const c = name[i];
+		// Collapse runs of spaces and drop leading ones; trailing ones are
+		// trimmed below. Only plain spaces: tabs etc. stay significant.
+		if (c == ' ' and (out.items.len == 0 or out.items[out.items.len - 1] == ' ')) {
+			i += 1;
+			continue;
+		}
+		out.append(c);
 		i += 1;
+	}
+	while (out.items.len != 0 and out.items[out.items.len - 1] == ' ') {
+		_ = out.pop();
 	}
 }
 
@@ -69,13 +81,28 @@ fn eqlFold(a: []const u8, b: []const u8) bool {
 	return true;
 }
 
+/// Strips leading/trailing underscores for the second match pass below.
+/// Internal underscores are significant ("Kitty_Katster" keeps its own).
+fn stripEdgeUnderscores(s: []const u8) []const u8 {
+	var a = s;
+	while (a.len != 0 and a[0] == '_') a = a[1..];
+	while (a.len != 0 and a[a.len - 1] == '_') a = a[0 .. a.len - 1];
+	return a;
+}
+
 /// Cleans a roster entry on the fly and compares against an already-cleaned
 /// live name. Also reused by `/unban` to match stored player-file names.
+/// Falls back to ignoring edge underscores ("__Hazel__" vs "Hazel"), but
+/// never matches empty strings (so "_" and "__" stay distinct non-matches).
 pub fn rosterMatch(rawEntry: []const u8, cleanedLive: []const u8) bool {
 	var cleanedEntry = main.ListManaged(u8).init(main.stackAllocator);
 	defer cleanedEntry.deinit();
 	appendCleaned(&cleanedEntry, rawEntry);
-	return std.mem.eql(u8, cleanedEntry.items, cleanedLive) or eqlFold(cleanedEntry.items, cleanedLive);
+	if (std.mem.eql(u8, cleanedEntry.items, cleanedLive) or eqlFold(cleanedEntry.items, cleanedLive)) return true;
+	const a = stripEdgeUnderscores(cleanedEntry.items);
+	const b = stripEdgeUnderscores(cleanedLive);
+	if (a.len == 0 or b.len == 0) return false;
+	return eqlFold(a, b);
 }
 
 pub fn load() void {
@@ -118,11 +145,31 @@ fn seasonTitleIndex(season: u3) ?usize {
 	return main.server.titles.indexOf(ids[season]);
 }
 
+/// Accounts that must never receive veteran badges: service/bot accounts whose
+/// names can coincidentally collide with roster entries (the Discord relay
+/// joined as "Discord", which matched a real veteran's row). Compared against
+/// the cleaned name, case-insensitively.
+const excludedNames = [_][]const u8{ "discord", "cctv" };
+
+fn isExcluded(cleanedName: []const u8) bool {
+	for (excludedNames) |ex| {
+		if (eqlFold(ex, cleanedName)) return true;
+	}
+	return false;
+}
+
 /// Grants any veteran seasons matching this player (key first, then name).
 /// Safe to call on every join: already-set bits are skipped silently.
 pub fn grant(user: *User) void {
 	load();
 	const prof = user.player();
+	// Service/bot accounts are never veterans, even if a name matches.
+	{
+		var cleaned = main.ListManaged(u8).init(main.stackAllocator);
+		defer cleaned.deinit();
+		appendCleaned(&cleaned, user.name);
+		if (isExcluded(cleaned.items)) return;
+	}
 	var mask: u8 = 0;
 	if (user.newKeyString) |key| {
 		for (keys.items) |entry| {
@@ -324,6 +371,16 @@ pub fn addLimbo(name: []const u8) bool {
 	return true;
 }
 
+/// Appends each set season bit (0-7) of `mask` to `arr` as ints.
+/// NOTE: the counter must NOT be u3 — `while (s < 8)` with a u3 never
+/// terminates and `s += 1` traps on 7+1 (this crashed every save()).
+fn appendSeasonBits(arr: *main.ZonElement, mask: u8) void {
+	var s: u8 = 0;
+	while (s < 8) : (s += 1) {
+		if (mask & (@as(u8, 1) << @intCast(s)) != 0) arr.array.append(.{.int = s});
+	}
+}
+
 fn save() void {
 	var zon = main.ZonElement.initObject(main.stackAllocator);
 	defer zon.deinit(main.stackAllocator);
@@ -332,10 +389,7 @@ fn save() void {
 		var o = main.ZonElement.initObject(main.stackAllocator);
 		o.put("name", e.name);
 		var seasons = main.ZonElement.initArray(main.stackAllocator);
-		var s: u3 = 0;
-		while (s < 8) : (s += 1) {
-			if (e.seasons & (@as(u8, 1) << s) != 0) seasons.array.append(.{.int = s});
-		}
+		appendSeasonBits(&seasons, e.seasons);
 		o.put("seasons", seasons);
 		nameArr.array.append(o);
 	}
@@ -345,10 +399,7 @@ fn save() void {
 		var o = main.ZonElement.initObject(main.stackAllocator);
 		o.put("key", e.key);
 		var seasons = main.ZonElement.initArray(main.stackAllocator);
-		var s: u3 = 0;
-		while (s < 8) : (s += 1) {
-			if (e.seasons & (@as(u8, 1) << s) != 0) seasons.array.append(.{.int = s});
-		}
+		appendSeasonBits(&seasons, e.seasons);
 		o.put("seasons", seasons);
 		keyArr.array.append(o);
 	}
@@ -361,3 +412,97 @@ fn save() void {
 	};
 }
 // --- ASHFRAME CUSTOM (Season veterans) ---
+
+test "veteran cleaner trims and collapses spaces" {
+	const t = main.heap.testingAllocator;
+	{
+		var out = main.ListManaged(u8).init(t);
+		defer out.deinit();
+		appendCleaned(&out, " Sleepy  Evergreen ");
+		try std.testing.expectEqualStrings("Sleepy Evergreen", out.items);
+	}
+	{
+		var out = main.ListManaged(u8).init(t);
+		defer out.deinit();
+		appendCleaned(&out, "#ff77ff__Hazel__ **:3**");
+		try std.testing.expectEqualStrings("__Hazel__ :3", out.items);
+	}
+	{
+		var out = main.ListManaged(u8).init(t);
+		defer out.deinit();
+		appendCleaned(&out, "Kitty_Katster");
+		try std.testing.expectEqualStrings("Kitty_Katster", out.items);
+	}
+}
+
+test "veteran rosterMatch underscore fallback" {
+	var a = main.ListManaged(u8).init(main.stackAllocator);
+	defer a.deinit();
+	appendCleaned(&a, "Hazel :3");
+	// Live name matches directly.
+	try std.testing.expect(rosterMatch("Hazel :3", a.items));
+	// Decorated roster variants match via cleaner + underscore fallback.
+	try std.testing.expect(rosterMatch("_MrGun_", a.items) == false); // different name entirely
+	var c = main.ListManaged(u8).init(main.stackAllocator);
+	defer c.deinit();
+	appendCleaned(&c, "MrGun");
+	try std.testing.expect(rosterMatch("_MrGun_", c.items));
+	try std.testing.expect(rosterMatch("Rivvien", c.items) == false);
+	var d = main.ListManaged(u8).init(main.stackAllocator);
+	defer d.deinit();
+	appendCleaned(&d, "Rivvien");
+	try std.testing.expect(rosterMatch("_Rivvien_", d.items));
+	// Internal underscores stay significant.
+	var b = main.ListManaged(u8).init(main.stackAllocator);
+	defer b.deinit();
+	appendCleaned(&b, "Kitty_Katster");
+	try std.testing.expect(rosterMatch("Kitty_Katster", b.items));
+	try std.testing.expect(!rosterMatch("KittyKatster", b.items));
+	// Degenerate all-underscore names never match.
+	try std.testing.expect(!rosterMatch("___", a.items));
+}
+
+test "veteran roster backslash names parse" {
+	// A name ending in a backslash must be escaped (\\) in the roster file,
+	// or the closing quote is swallowed and parsing derails into following
+	// rows (killed a whole roster load once). Regression test.
+	const case_ = ".{\n\t.names = .{\n\t\t.{.name = \"\\\\VESSEL\\\\\", .seasons = .{2}},\n\t\t.{.name = \"plain\", .seasons = .{1}},\n\t},\n}";
+	var zon = main.ZonElement.parseFromString(main.stackAllocator, null, case_);
+	defer zon.deinit(main.stackAllocator);
+	const nameList = zon.getChild("names").toSlice();
+	try std.testing.expect(nameList.len == 2);
+	try std.testing.expectEqualStrings("\\VESSEL\\", nameList[0].get([]const u8, "name").?);
+	try std.testing.expectEqualStrings("plain", nameList[1].get([]const u8, "name").?);
+}
+
+test "veteran bot accounts never match the roster" {
+	try std.testing.expect(isExcluded("Discord"));
+	try std.testing.expect(isExcluded("discord"));
+	try std.testing.expect(isExcluded("CCTV"));
+	try std.testing.expect(isExcluded("cctv"));
+	try std.testing.expect(!isExcluded("DiscordUser"));
+	try std.testing.expect(!isExcluded("iNiKKo"));
+}
+
+test "veteran season bits iterate the full mask without overflow" {
+	// Regression: the old `var s: u3` counter with `while (s < 8)` never
+	// terminated and trapped on 7+1, crashing every save() (all /veteran
+	// mutations). Masks touching bit 7 prove full-range termination.
+	const cases = [_]struct { mask: u8, want: []const u8 }{
+		.{ .mask = 0x00, .want = &.{} },
+		.{ .mask = 0x01, .want = &.{0} },
+		.{ .mask = 0b00001111, .want = &.{ 0, 1, 2, 3 } },
+		.{ .mask = 0x80, .want = &.{7} },
+		.{ .mask = 0xFF, .want = &.{ 0, 1, 2, 3, 4, 5, 6, 7 } },
+		.{ .mask = 0b10100101, .want = &.{ 0, 2, 5, 7 } },
+	};
+	for (cases) |c| {
+		var arr = main.ZonElement.initArray(main.stackAllocator);
+		defer arr.deinit(main.stackAllocator);
+		appendSeasonBits(&arr, c.mask);
+		try std.testing.expectEqual(c.want.len, arr.array.items.len);
+		for (c.want, 0..) |want, i| {
+			try std.testing.expectEqual(want, arr.array.items[i].as(u8).?);
+		}
+	}
+}

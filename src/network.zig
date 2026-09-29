@@ -542,6 +542,45 @@ pub const ConnectionManager = struct { // MARK: ConnectionManager
 		}
 	};
 
+	// --- ASHFRAME CUSTOM (NET-001: channel backlog observability) ---
+	/// Queued (unsent) + unconfirmed (in-flight) bytes per channel, summed
+	/// over all connections. Read-only snapshot for metrics; takes the
+	/// manager mutex (protects the connection list). Per-connection channel
+	/// fields are read lock-free, same as the debug-network window.
+	pub const ChannelTotals = struct {
+		lossyQueued: usize = 0,
+		lossyUnconfirmed: usize = 0,
+		secureQueued: usize = 0,
+		secureUnconfirmed: usize = 0,
+		slowQueued: usize = 0,
+		slowUnconfirmed: usize = 0,
+	};
+
+	pub fn channelTotals(self: *ConnectionManager) ChannelTotals {
+		var totals = ChannelTotals{};
+		self.mutex.lock();
+		defer self.mutex.unlock();
+		for (self.connections.items) |conn| {
+			var u: usize = 0;
+			var q: usize = 0;
+			conn.lossyChannel.getStatistics(&u, &q);
+			totals.lossyUnconfirmed += u;
+			totals.lossyQueued += q;
+			u = 0;
+			q = 0;
+			conn.secureChannel.getStatistics(&u, &q);
+			totals.secureUnconfirmed += u;
+			totals.secureQueued += q;
+			u = 0;
+			q = 0;
+			conn.slowChannel.getStatistics(&u, &q);
+			totals.slowUnconfirmed += u;
+			totals.slowQueued += q;
+		}
+		return totals;
+	}
+	// --- ASHFRAME CUSTOM (NET-001) ---
+
 	pub fn init(localPort: u16, options: struct { allowNewConnections: bool = false }) !*ConnectionManager {
 		const result: *ConnectionManager = main.globalAllocator.create(ConnectionManager);
 		errdefer main.globalAllocator.destroy(result);
@@ -798,6 +837,11 @@ pub const ConnectionManager = struct { // MARK: ConnectionManager
 		}
 	}
 };
+
+// --- UPSTREAM PR #3191 (triage): RTT-independent congestion ramp. ---
+const minimumBandWidth = 10_000;
+const congestionBandwidthIncrement = 100_000.0/(1000.0*ms); // bytes/s²
+// --- UPSTREAM PR #3191 (triage) ---
 
 pub const Connection = struct { // MARK: Connection
 	const maxMtu: u32 = 65507; // max udp packet size
@@ -1691,7 +1735,9 @@ pub const Connection = struct { // MARK: Connection
 		if (self.slowStart) {
 			self.bandwidthEstimateInBytesPerRtt += fullPacketLen;
 		} else {
-			self.bandwidthEstimateInBytesPerRtt += fullPacketLen/self.bandwidthEstimateInBytesPerRtt*@as(f32, @floatFromInt(self.mtuEstimate)) + fullPacketLen/100.0;
+			// --- UPSTREAM PR #3191 (triage): fixed RTT-independent ramp. ---
+			self.bandwidthEstimateInBytesPerRtt += fullPacketLen/self.bandwidthEstimateInBytesPerRtt*self.rttEstimate*congestionBandwidthIncrement;
+			// --- UPSTREAM PR #3191 (triage) ---
 		}
 	}
 

@@ -78,6 +78,48 @@ fn stripSpaces(out: *main.ListManaged(u8), src: []const u8) void {
 	}
 }
 
+/// Copies `src` to `out`, blanking tokens that are plain numbers (e.g. "900k",
+/// "10m", "80085"): leet-mapping their digits would turn quantities into slurs
+/// ("900k" -> "gook"). Only tokens of 2+ digits with an optional single k/m/b
+/// magnitude suffix are blanked, so spaced evasions like "g 0 o k" (single
+/// digits) still match, as do mixed tokens like "g00k"/"f4g".
+fn maskNumericTokens(out: *main.ListManaged(u8), src: []const u8) void {
+	var i: usize = 0;
+	while (i < src.len) {
+		const c = src[i];
+		if (!isAlnumAny(c)) {
+			out.append(c);
+			i += 1;
+			continue;
+		}
+		var j = i;
+		while (j < src.len and isAlnumAny(src[j])) : (j += 1) {}
+		const token = src[i..j];
+		if (isNumericToken(token)) {
+			out.append(' ');
+		} else {
+			out.appendSlice(token);
+		}
+		i = j;
+	}
+}
+
+fn isNumericToken(token: []const u8) bool {
+	if (token.len < 2) return false;
+	var digits = token.len;
+	if (token[token.len - 1] == 'k' or token[token.len - 1] == 'K' or
+		token[token.len - 1] == 'm' or token[token.len - 1] == 'M' or
+		token[token.len - 1] == 'b' or token[token.len - 1] == 'B')
+	{
+		digits -= 1;
+	}
+	if (digits < 2) return false;
+	for (token[0..digits]) |c| {
+		if (c < '0' or c > '9') return false;
+	}
+	return true;
+}
+
 /// Returns the matched term, or null if clean.
 pub fn findBad(text: []const u8) ?[]const u8 {
 	// Strip color codes/markdown first so hex digits from decorations (e.g.
@@ -85,16 +127,21 @@ pub fn findBad(text: []const u8) ?[]const u8 {
 	var stripped = main.ListManaged(u8).init(main.stackAllocator);
 	defer stripped.deinit();
 	main.server.veterans.appendCleaned(&stripped, text);
+	// Blank pure-number tokens (see maskNumericTokens) so quantities can never
+	// leet-match a slur; everything else flows through unchanged.
+	var masked = main.ListManaged(u8).init(main.stackAllocator);
+	defer masked.deinit();
+	maskNumericTokens(&masked, stripped.items);
 	var norm = main.ListManaged(u8).init(main.stackAllocator);
 	defer norm.deinit();
-	normalise(&norm, stripped.items);
+	normalise(&norm, masked.items);
 	var normFlat = main.ListManaged(u8).init(main.stackAllocator);
 	defer normFlat.deinit();
 	stripSpaces(&normFlat, norm.items);
 	// Second pass with the `1`/`!`/`|`-as-`i` reading (`n1gger`, `k1ke`).
 	var normI = main.ListManaged(u8).init(main.stackAllocator);
 	defer normI.deinit();
-	normaliseMapped(&normI, stripped.items, true);
+	normaliseMapped(&normI, masked.items, true);
 	var normIFlat = main.ListManaged(u8).init(main.stackAllocator);
 	defer normIFlat.deinit();
 	stripSpaces(&normIFlat, normI.items);

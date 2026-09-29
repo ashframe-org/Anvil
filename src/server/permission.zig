@@ -373,6 +373,8 @@ fn createDefaultPermissionGroups() void {
 		Group.moderator.addPermission(.white, "/ashframe/admin/skyscan") catch unreachable;
 		Group.moderator.addPermission(.white, "/command/report") catch unreachable;
 		Group.moderator.addPermission(.white, "/ashframe/admin/report") catch unreachable;
+		Group.moderator.addPermission(.white, "/ashframe/admin/veteran") catch unreachable;
+		Group.moderator.addPermission(.white, "/ashframe/admin/gamemode") catch unreachable;
 		// --- ASHFRAME CUSTOM (admin sub-permissions) ---
 	}
 }

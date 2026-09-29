@@ -109,10 +109,16 @@ pub fn allianceOf(index: usize) ?usize {
 	return findMembership(index);
 }
 
-/// Sum of the unused claim slots the members contributed.
+/// Sum of the members' *currently* unused claim slots. Computed live from what
+/// each member owns right now (not the join-time `contributed` snapshot, which
+/// would go stale — and grant phantom slots — as members claim their own land).
+/// Members keep full personal claim rights; only genuinely unused slots pool.
 pub fn pooledSlots(a: *const Alliance) u16 {
+	ensure();
 	var n: u16 = 0;
-	for (a.members[0..a.memberCount]) |m| n += m.contributed;
+	for (a.members[0..a.memberCount]) |m| {
+		n += baseMaxClaims -| @as(u16, main.server.claims.countOwned(m.index));
+	}
 	return n;
 }
 
@@ -140,7 +146,8 @@ pub fn isMember(index: usize) bool {
 
 pub fn maxClaimsFor(index: usize) u16 {
 	if (findLedBy(index)) |i| return baseMaxClaims + pooledSlots(&alliances.items[i]);
-	if (findMembership(index) != null) return main.server.claims.countOwned(index);
+	// Members keep full personal claim rights (base), so they can expand or
+	// claim outside — joining no longer freezes them at what they own.
 	return baseMaxClaims;
 }
 
@@ -155,6 +162,31 @@ pub fn isMemberOf(leader: usize, index: usize, key: []const u8) bool {
 		if (m.index != index) continue;
 		if (m.key.len == 0) return true;
 		return key.len != 0 and std.mem.eql(u8, m.key, key);
+	}
+	return false;
+}
+
+/// True if `userIdx` (account `userKey`) and `ownerIdx` participate in the SAME
+/// alliance — in either direction (leader↔member or member↔member). This is what
+/// makes alliance land mutual: anyone in the alliance builds on anyone's claims.
+/// Key verification mirrors `isMemberOf` (leader→ownerKey, member→member key;
+/// keyless legacy falls back to the index), so adopted indices gain nothing.
+pub fn inSameAlliance(userIdx: usize, userKey: []const u8, ownerIdx: usize) bool {
+	ensure();
+	if (userIdx == ownerIdx) return true;
+	const au = allianceOf(userIdx) orelse return false;
+	const ao = allianceOf(ownerIdx) orelse return false;
+	if (au != ao) return false;
+	const a = &alliances.items[au];
+	// Verify the *user* side genuinely belongs (keys beat adopted indices).
+	if (a.owner == userIdx) {
+		if (a.ownerKey.len == 0) return true;
+		return userKey.len != 0 and std.mem.eql(u8, a.ownerKey, userKey);
+	}
+	for (a.members[0..a.memberCount]) |m| {
+		if (m.index != userIdx) continue;
+		if (m.key.len == 0) return true;
+		return userKey.len != 0 and std.mem.eql(u8, m.key, userKey);
 	}
 	return false;
 }

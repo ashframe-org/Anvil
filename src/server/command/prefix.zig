@@ -25,6 +25,20 @@ pub fn execute(args: Args, source: Source) void {
 		.@"/prefix add <playerIndex> <text>" => |params| {
 			const target = command.Target.fromPlayerIndex(params.playerIndex, source) catch return;
 
+			// Prefixes land in every chat line and nametag of the target, so
+			// they get the same validation as player names at handshake:
+			// valid UTF-8, bounded visible length. (Previously unvalidated —
+			// a single hostile paste could crash every viewer.)
+			const maxPrefixVisible: usize = 32;
+			if (!std.unicode.utf8ValidateSlice(params.text.text)) {
+				source.sendMessage("#e6312cPrefix contains invalid characters.", .{});
+				return;
+			}
+			if (main.graphics.TextBuffer.Parser.countVisibleCharacters(params.text.text) > maxPrefixVisible) {
+				source.sendMessage("#e6312cPrefix too long (max {d} visible characters).", .{maxPrefixVisible});
+				return;
+			}
+
 			if (target.user.player().prefix) |oldPrefix| {
 				main.globalAllocator.free(oldPrefix);
 			}

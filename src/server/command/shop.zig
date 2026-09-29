@@ -58,13 +58,13 @@ fn setup(user: *User, source: Source, mode: shops.Mode, amount: u16, goodsStr: [
 	if (shops.isChestBlock(targetBlock)) {
 		chest = target;
 		sign = shops.findNeighborSign(target) orelse {
-			source.sendMessage("#e6312cPlace a sign on the chest first.", .{});
+			source.sendMessage("#e6312cPlace a sign directly on the side of the chest first.", .{});
 			return;
 		};
 	} else if (shops.isSignBlock(targetBlock)) {
 		sign = target;
 		chest = shops.findNeighborChest(target) orelse {
-			source.sendMessage("#e6312cPlace this sign on a chest.", .{});
+			source.sendMessage("#e6312cThis sign must be mounted on the side of a chest.", .{});
 			return;
 		};
 	} else {
@@ -88,16 +88,10 @@ fn setup(user: *User, source: Source, mode: shops.Mode, amount: u16, goodsStr: [
 
 	var nameBuf: [shops.maxNameLen]u8 = undefined;
 	const ownerName = shops.signName(user.name, &nameBuf);
-	var buf: [256]u8 = undefined;
-	const text = shops.formatSignText(mode, amount, goods, priceAmount, price, ownerName, &buf) catch {
-		source.sendMessage("#e6312cCould not build the sign text.", .{});
-		return;
-	};
-	if (!shops.writeSign(sign, text)) {
+	if (!shops.writeShopSign(sign, mode, amount, goods, priceAmount, price, ownerName)) {
 		source.sendMessage("#e6312cCould not write the sign.", .{});
 		return;
 	}
-	main.network.protocols.blockEntityUpdate.sendServerDataUpdateToClients(sign);
 	_ = shops.create(user, chest, sign, mode, goods, amount, price, priceAmount);
 	const verb = if (mode == .sell) "selling" else "buying";
 	source.sendMessage("#00ff00Shop created: #cfcfcf{s} #e6312c{d} {s}#cfcfcf for #e6312c{d} {s}#cfcfcf.", .{verb, amount, goods.name(), priceAmount, price.name()});

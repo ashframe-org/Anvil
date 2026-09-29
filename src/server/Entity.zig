@@ -43,9 +43,16 @@ is_afk: bool = false,
 	// violations; the server thread kicks so teardown never runs off-thread.
 	pendingKick: bool = false,
 	// Session-only (not persisted): movement-violation count + window start
-	// for the repeat-speeder auto-kick.
+	// for the repeat-speeder auto-kick, plus a consecutive-over-threshold
+	// streak so a single laggy sample never pages the operators.
 	moveViolations: u32 = 0,
 	moveViolationWindowStart: i64 = 0,
+	moveViolationStreak: u8 = 0,
+	// Session-only (not persisted): creative-op abuse count + window start
+	// for the auto-kick below (sustained instant-break, creative-only packets
+	// from a survival account). Same pattern as the movement counters.
+	creativeOpViolations: u32 = 0,
+	creativeOpWindowStart: i64 = 0,
 	seenBiomes: ?[]const u8 = null,
 	// Session-only (not persisted):
 	last_biome_check: i64 = 0,
@@ -78,6 +85,27 @@ is_afk: bool = false,
 	/// notice (a jump looks like stepping off and back on, which re-fired the
 	/// old once-per-stand latch every hop). Session-only, never persisted.
 	anchorCooldownNotifiedAt: i64 = 0,
+	/// Stand-on tracking for the waypoint anti-troll delay: the anchor the
+	/// player has been continuously above, and when the stand started
+	/// (monotonic seconds). Reset whenever they leave it. Session-only.
+	anchorStandPos: ?[3]i32 = null,
+	anchorStandSince: i64 = 0,
+	/// Async destination preload: held simulation-chunk refs while waiting for
+	/// the far anchor's neighborhood to load, plus which destination they were
+	/// requested for and when the wait started (monotonic seconds, for the
+	/// load timeout). The landing search touches the anchor chunk and its
+	/// neighbors (up to 8 distinct 32-chunks: ±1 block horizontally, +0..+3
+	/// vertically); holding a ref per chunk keeps each load task alive (see
+	/// ChunkLoadTask culling). Released on arrival, stand break, destination
+	/// change, or deinit. Session-only.
+	anchorLoadChunks: [8]?*main.server.SimulationChunk = .{null} ** 8,
+	anchorLoadCount: usize = 0,
+	anchorLoadPos: [3]i32 = .{ 0, 0, 0 },
+	anchorLoadSince: i64 = 0,
+	/// Re-fire suppression: the destination anchor just teleported to. While
+	/// the player stands on it, the waypoint won't fire again — they must step
+	/// off (clears this) and step back on. Session-only.
+	anchorSuppressPos: ?[3]i32 = null,
 	// --- ASHFRAME CUSTOM (Teleport costs) ---
 	// --- ASHFRAME CUSTOM (Fields) ---
 
@@ -262,6 +290,11 @@ pub fn deinit(self: *@This(), comptime side: main.sync.Side) void {
 		self.name = null;
 	}
 	if (side == .server) {
+		for (self.anchorLoadChunks[0..self.anchorLoadCount]) |slot| {
+			if (slot) |held| held.decreaseRefCount();
+		}
+		self.anchorLoadChunks = .{null} ** 8;
+		self.anchorLoadCount = 0;
 		main.entity.server.removeAllComponents(self.id);
 	} else {
 		main.entity.client.removeAllComponents(self.id);

@@ -128,12 +128,11 @@ pub fn execute(args: Args, source: Source) void {
 				return;
 			};
 			const a = &alliances.list()[ai];
-			source.sendMessage("#f2f2f2--- #e6312c{s}#f2f2f2 ({s}) ---", .{ a.name, if (a.isPublic) "public" else "private" });
-			source.sendMessage("#cfcfcfLeader: #e6312c{s}#cfcfcf. Members: {d}. Max claims: {d}.", .{ leaderName(a.owner), a.memberCount, alliances.baseMaxClaims + alliances.pooledSlots(a) });
-			var dateBuf: [16]u8 = undefined;
-			for (a.members[0..a.memberCount]) |m| {
-				source.sendMessage("#cfcfcf- {s} #8a8a8a(joined {s})", .{m.name, formatDate(&dateBuf, m.joinedAt)});
-			}
+		source.sendMessage("#f2f2f2--- #e6312c{s}#f2f2f2 ({s}) ---", .{ a.name, if (a.isPublic) "public" else "private" });
+		source.sendMessage("#cfcfcfLeader: #e6312c{s}#cfcfcf. Members: {d}. Max claims: {d}.", .{ leaderName(a.owner), a.memberCount, alliances.baseMaxClaims + alliances.pooledSlots(a) });
+		for (a.members[0..a.memberCount]) |m| {
+			source.sendMessage("#cfcfcf- {s}", .{m.name});
+		}
 		},
 		.@"/alliance list <page>" => |p| listAlliances(source, p.page),
 		.@"/alliance list" => listAlliances(source, 1),

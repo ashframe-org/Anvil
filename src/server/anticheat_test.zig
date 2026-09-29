@@ -141,6 +141,24 @@ test "cheat: chat filter word boundaries" {
 	try report("chatfilter clean text", "good morning everyone", if (clean) "matched" else "clean", false, !clean);
 }
 
+test "cheat: chat filter numbers are not slurs" {
+	// Regression: "900k" leet-normalised to "gook" (9->g, 0->o) and struck an
+	// innocent player. Pure-number tokens must never match.
+	const num1 = main.server.chatfilter.findBad("i have 900k orbs") != null;
+	try report("chatfilter '900k' clean", "900k", if (num1) "matched" else "clean", false, !num1);
+	const num2 = main.server.chatfilter.findBad("selling 10m stone") != null;
+	try report("chatfilter '10m' clean", "10m", if (num2) "matched" else "clean", false, !num2);
+	const num3 = main.server.chatfilter.findBad("80085") != null;
+	try report("chatfilter '80085' clean", "80085", if (num3) "matched" else "clean", false, !num3);
+	// Real leet evasions still match: mixed letter+digit tokens are mapped.
+	const evade1 = main.server.chatfilter.findBad("you g00k") != null;
+	try report("chatfilter 'g00k' matched", "g00k", if (evade1) "matched" else "clean", true, evade1);
+	const evade2 = main.server.chatfilter.findBad("you are a f4g") != null;
+	try report("chatfilter 'f4g' matched", "f4g", if (evade2) "matched" else "clean", true, evade2);
+	const real = main.server.chatfilter.findBad("you are a gook") != null;
+	try report("chatfilter plain 'gook' matched", "gook", if (real) "matched" else "clean", true, real);
+}
+
 test "cheat: ban lookup with no bans" {
 	const banned = main.server.chatfilter.isBanned("CleanPlayer", null);
 	try report("ban lookup (empty list)", "CleanPlayer", if (banned) "banned" else "not banned", false, !banned);
@@ -168,4 +186,17 @@ test "cheat: chat filter leetspeak and color noise" {
 	try report("chatfilter leet n1gger", "n1gger", if (leetLong) "matched" else "clean", true, leetLong);
 	const colorNoise = main.server.chatfilter.findBad("#fff hello there") != null;
 	try report("chatfilter color noise clean", "#fff hello", if (colorNoise) "matched" else "clean", false, !colorNoise);
+}
+
+test "cheat: flight pattern predicate" {
+	// Fly/ghost envelope: fast horizontal, not falling.
+	try check("flight hover 32,0", "32,0", anticheat.isFlightLike(32.0, 0.0), true);
+	try check("flight ghost 128,0", "128,0", anticheat.isFlightLike(128.0, 0.0), true);
+	try check("flight ascend 20,10", "20,10", anticheat.isFlightLike(20.0, 10.0), true);
+	// Legit: sprint (~8), walk, jump arcs, freefall (~-90).
+	try check("sprint 8,0", "8,0", anticheat.isFlightLike(8.0, 0.0), false);
+	try check("walk 4.5,0", "4.5,0", anticheat.isFlightLike(4.5, 0.0), false);
+	try check("fall 5,-90", "5,-90", anticheat.isFlightLike(5.0, -90.0), false);
+	try check("fast fall drift 20,-50", "20,-50", anticheat.isFlightLike(20.0, -50.0), false);
+	try check("idle 0,0", "0,0", anticheat.isFlightLike(0.0, 0.0), false);
 }

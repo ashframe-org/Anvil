@@ -92,6 +92,34 @@ pub const handShake = struct { // MARK: handShake
 	var hasFinishedLoadingAssets: bool = false;
 	var handshakeZon: ZonElement = undefined;
 
+	// --- ASHFRAME CUSTOM (UX-5a: asset pack cache) ---
+	// The packed asset tree is identical for every join until the files
+	// change, but packing re-walked + re-deflated all files per handshake.
+	// Cache the deflated bytes keyed by a content hash. The full pack is
+	// still SENT every join (vanilla-safe); only the repeated pack() work
+	// is skipped. Guarded by a mutex: handshakes run on network threads.
+	var assetPackCache: ?[]u8 = null;
+	var assetPackHash: u64 = 0;
+	var assetPackMutex: main.utils.Mutex = .{};
+
+	/// Order-independent content hash of an asset dir: XOR of per-file
+	/// path+content hashes, so walk order never matters.
+	fn assetTreeHash(dir: main.files.Dir) !u64 {
+		var h: u64 = 0;
+		var walker = dir.walk(main.stackAllocator);
+		defer walker.deinit();
+		while (try walker.next(main.io)) |entry| {
+			if (entry.kind != .file) continue;
+			const relPath: []const u8 = entry.path;
+			const fileData = try dir.read(main.stackAllocator, relPath);
+			defer main.stackAllocator.free(fileData);
+			h +%= std.hash.Wyhash.hash(0, relPath);
+			h +%= std.hash.Wyhash.hash(0, fileData);
+		}
+		return h;
+	}
+	// --- ASHFRAME CUSTOM (UX-5a) ---
+
 	pub fn clientReceive(conn: *Connection, reader: *utils.BinaryReader) !void {
 		const newState = try reader.readEnum(Connection.HandShakeState);
 		if (@intFromEnum(conn.handShakeState.load(.monotonic)) < @intFromEnum(newState)) {
@@ -168,6 +196,13 @@ pub const handShake = struct { // MARK: handShake
 					}
 					const version = zon.get([]const u8, "version") orelse "unknown";
 					std.log.info("User {s} joined using version {s}", .{name, version});
+					// --- ASHFRAME CUSTOM (UX-6: asset pack skip) ---
+					// Custom clients announce their cached pack hash; vanilla
+					// clients omit the field and always get the full pack.
+					if (zon.get(i64, "ashframePackHash")) |h| {
+						conn.user.?.ashframePackHash = @bitCast(h);
+					}
+					// --- ASHFRAME CUSTOM (UX-6) ---
 
 					if (!try settings.version.isCompatibleClientVersion(version)) {
 						std.log.warn("Version incompatible with server version {s}", .{settings.version.version});
@@ -226,11 +261,65 @@ pub const handShake = struct { // MARK: handShake
 						defer main.stackAllocator.free(path);
 						var dir = try main.files.cubyzDir().openIterableDir(path);
 						defer dir.close();
+						// --- ASHFRAME CUSTOM (UX-5a: asset pack cache) ---
+						// Hash the tree (cheap walk, no deflate); on hit, send
+						// a copy of the cached pack. On miss, pack fresh into
+						// a global-owned buffer and promote it to the cache.
+						// conn.send copies synchronously, but we dupe anyway
+						// so no lock is held across the send.
+						const hash = try assetTreeHash(dir);
+						assetPackMutex.lock();
+						var owned: []u8 = undefined;
+						var ownedIsDupe = false;
+						if (assetPackCache) |cached| {
+							if (assetPackHash == hash) {
+								owned = main.globalAllocator.dupe(u8, cached);
+								ownedIsDupe = true;
+							}
+						}
+						if (!ownedIsDupe) {
+							var packer = try std.Io.Writer.Allocating.initCapacity(main.globalAllocator.allocator, 16);
+							errdefer packer.deinit();
+							try utils.Compression.pack(dir, &packer.writer);
+							const packedBytes = try packer.toOwnedSlice();
+							if (assetPackCache) |old| main.globalAllocator.free(old);
+							assetPackCache = packedBytes;
+							assetPackHash = hash;
+							owned = main.globalAllocator.dupe(u8, packedBytes);
+							ownedIsDupe = true;
+						}
+						assetPackMutex.unlock();
+						defer main.globalAllocator.free(owned);
+						// --- ASHFRAME CUSTOM (UX-6b: asset pack skip) ---
+						// Compare against the hash of the packed bytes actually
+						// being sent (same function the client uses on what it
+						// received). The tree hash above is only for the pack
+						// cache lookup; it can never match a client value.
+						// Vanilla clients never announce -> full pack, as ever.
+						if (main.settings.launchConfig.ashframePackSkip) {
+							if (conn.user.?.ashframePackHash) |announced| {
+								const sentHash = std.hash.Wyhash.hash(0, owned);
+								if (announced == sentHash) {
+									std.log.info("[ashframe] pack skip for {s}: client cache matches, sending marker", .{conn.user.?.name});
+									var marker = try std.Io.Writer.Allocating.initCapacity(main.stackAllocator.allocator, 16);
+									defer marker.deinit();
+									try marker.writer.writeByte(@intFromEnum(Connection.HandShakeState.assets));
+									conn.send(.secure, id, marker.written());
+									conn.handShakeState.store(.assets, .monotonic);
+									main.server.connect(conn.user.?);
+									return;
+								} else {
+									std.log.debug("[ashframe] pack hash mismatch for {s}: announced={d} current={d}, sending full pack", .{ conn.user.?.name, announced, sentHash });
+								}
+							}
+						}
+						// --- ASHFRAME CUSTOM (UX-6b) ---
 						var writer = try std.Io.Writer.Allocating.initCapacity(main.stackAllocator.allocator, 16);
 						defer writer.deinit();
 						try writer.writer.writeByte(@intFromEnum(Connection.HandShakeState.assets));
-						try utils.Compression.pack(dir, &writer.writer);
+						try writer.writer.writeAll(owned);
 						conn.send(.secure, id, writer.written());
+						// --- ASHFRAME CUSTOM (UX-5a) ---
 					}
 					conn.handShakeState.store(.assets, .monotonic);
 
@@ -451,18 +540,50 @@ pub const chunkTransmission = struct { // MARK: chunkTransmission
 	}
 	fn sendChunkOverTheNetwork(conn: *Connection, ch: *chunk.ServerChunk) void {
 		main.server.metrics.noteChunkSent();
+		// --- ASHFRAME CUSTOM (UX-2a: compress outside the chunk lock) ---
+		// Extract everything that reads chunk state under the lock (palette,
+		// voxels, hiding/smoothing, block entities), then release it BEFORE
+		// the ~0.6-1.2 ms deflate. Same bytes as storeChunk, just split.
+		const CC = main.server.storage.ChunkCompression;
 		ch.mutex.lock();
-		const chunkData = main.server.storage.ChunkCompression.storeChunk(main.stackAllocator, &ch.super, .toClient, ch.super.pos.voxelSize != 1);
+		var extraction: CC.BlockDataExtraction = undefined;
+		const voxels = main.stackAllocator.alloc(u8, chunk.chunkVolume*@sizeOf(u32));
+		defer main.stackAllocator.free(voxels);
+		CC.extractBlockData(&ch.super, ch.super.pos.voxelSize != 1, main.settings.launchConfig.antiXray, voxels, &extraction);
+		var entWriter = utils.BinaryWriter.init(main.stackAllocator);
+		defer entWriter.deinit();
+		CC.compressBlockEntityData(&ch.super, .toClient, &entWriter);
+		const chunkWx = ch.super.pos.wx;
+		const chunkWy = ch.super.pos.wy;
+		const chunkWz = ch.super.pos.wz;
+		const chunkVoxelSize = ch.super.pos.voxelSize;
 		ch.mutex.unlock();
-		defer main.stackAllocator.free(chunkData);
-		var writer = utils.BinaryWriter.initCapacity(main.stackAllocator, chunkData.len + 16);
+		// --- ASHFRAME CUSTOM (NET-001: compress-time observability) ---
+		const compressT0 = main.timestamp();
+		var blockWriter = utils.BinaryWriter.init(main.stackAllocator);
+		defer blockWriter.deinit();
+		CC.writeExtractedBlockData(main.stackAllocator, &extraction, voxels[0..extraction.voxelBytes], &blockWriter);
+		const compressNs = compressT0.durationTo(main.timestamp()).toNanoseconds();
+		main.server.metrics.noteChunkCompressUs(@intCast(@max(0, @divTrunc(compressNs, 1000))));
+		// --- ASHFRAME CUSTOM (NET-001) ---
+		const chunkData = blockWriter.data.items;
+		var writer = utils.BinaryWriter.initCapacity(main.stackAllocator, chunkData.len + entWriter.data.items.len + 16);
 		defer writer.deinit();
-		writer.writeInt(i32, ch.super.pos.wx);
-		writer.writeInt(i32, ch.super.pos.wy);
-		writer.writeInt(i32, ch.super.pos.wz);
-		writer.writeInt(u31, ch.super.pos.voxelSize);
+		writer.writeInt(i32, chunkWx);
+		writer.writeInt(i32, chunkWy);
+		writer.writeInt(i32, chunkWz);
+		writer.writeInt(u31, chunkVoxelSize);
 		writer.writeSlice(chunkData);
-		conn.send(.secure, id, writer.data.items); // TODO: Can this use the slow channel?
+		writer.writeSlice(entWriter.data.items);
+		// --- ASHFRAME CUSTOM (UX-2a) ---
+		// --- ASHFRAME CUSTOM (UX-1: chunks on the slow channel) ---
+		// Chunk bursts (up to ~3.4 MB queued, 7.6 MB/s) used to ride `.secure`
+		// and head-of-line-block gameplay acks (position, block edits,
+		// teleports). `.slow` has its own window/pacing; the client handles
+		// it natively and protocol dispatch is by id, not channel, so this
+		// is vanilla-safe. Answers the TODO above: yes.
+		conn.send(.slow, id, writer.data.items);
+		// --- ASHFRAME CUSTOM (UX-1) ---
 	}
 	pub fn sendChunk(conn: *Connection, ch: *chunk.ServerChunk) void {
 		sendChunkOverTheNetwork(conn, ch);
@@ -826,6 +947,8 @@ pub const genericUpdate = struct { // MARK: genericUpdate
 	}
 
 	pub fn sendParticles(conn: *Connection, particleId: []const u8, pos: Vec3d, collides: bool, count: u32, spawnZon: []const u8) void {
+		// Bisect toggle: mute all custom particle sends (all callers are ours).
+		if (!main.settings.launchConfig.customParticles) return;
 		const bufferSize = particleId.len*8 + 32;
 		var writer = utils.BinaryWriter.initCapacity(main.stackAllocator, bufferSize);
 		defer writer.deinit();
@@ -1035,10 +1158,24 @@ pub const inventory = struct { // MARK: inventory
 		const user = conn.user.?;
 		if (reader.remaining.len == 0) return error.Invalid;
 		if (reader.remaining[0] == 0xff) return error.Invalid;
-		if (!user.rateInventory.allow(main.server.anticheat.nowMilliseconds())) {
-			main.server.anticheat.note(user, .rate, "inventory");
-			return;
+		// --- ASHFRAME CUSTOM (Split rate gates) ---
+		// Damage reports and inventory/crafting traffic must never be starved
+		// by rate limiting: a dry bucket silently discards damage
+		// (invincibility) or leaves the client's optimistic inventory change
+		// hanging with no reply (stuck items, uncraftable recipes). Both
+		// bypass rate limiting entirely (the queue cap in receiveCommand
+		// already bounds floods); block place/break keeps its own generous
+		// bucket as the remaining flood guard.
+		const payloadTag = reader.remaining[0];
+		const isBlockEdit = payloadTag == @intFromEnum(main.sync.Command.PayloadType.updateBlock);
+		if (isBlockEdit) {
+			if (!user.rateBlock.allow(main.server.anticheat.nowMilliseconds())) {
+				// Review-only: bursts from fast building are legitimate.
+				main.server.anticheat.suspect(user, .rate, "block");
+				return;
+			}
 		}
+		// --- ASHFRAME CUSTOM (Split rate gates) ---
 		main.sync.server.receiveCommand(user, reader);
 	}
 	pub fn sendCommand(conn: *Connection, payloadType: main.sync.Command.PayloadType, _data: []const u8) void {
@@ -1091,12 +1228,17 @@ pub const blockEntityUpdate = struct { // MARK: blockEntityUpdate
 				}
 			}
 			// --- ASHFRAME CUSTOM (Sign shops) ---
-			// --- ASHFRAME CUSTOM (Anticheat: reach) ---
-			if (conn.user) |user| {
-				if (!main.server.anticheat.checkReach(user, .{pos[0], pos[1], pos[2]})) return;
-			}
-			// --- ASHFRAME CUSTOM (Anticheat) ---
-			if (main.server.chatfilter.findBad(reader.remaining) != null) {
+		// --- ASHFRAME CUSTOM (Anticheat: reach) ---
+		if (conn.user) |user| {
+			if (!main.server.anticheat.checkReach(user, .{pos[0], pos[1], pos[2]})) return;
+		}
+		// --- ASHFRAME CUSTOM (Anticheat) ---
+		// NOTE: a claim check (canBuild) was tried here and REMOVED: this
+		// handler runs on the network thread, and canBuild reaches
+		// permissions.hasPermission, which asserts server-thread-only and
+		// aborts the whole server on any sign edit. Sign text is therefore
+		// NOT claim-gated (shop offer text is still protected above).
+		if (main.server.chatfilter.findBad(reader.remaining) != null) {
 				if (conn.user) |user| {
 					// The ban is completed on the server thread.
 					_ = main.server.chatfilter.strike(user);

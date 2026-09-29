@@ -11,6 +11,10 @@ const User = main.server.User;
 pub const halfX: i32 = 8;
 pub const halfZ: i32 = 8;
 pub const halfY: i32 = 16;
+/// Retired: spawn used to be unclaimable (±200). Removed so an alliance can
+/// claim spawn itself (locking out griefing while trusted players can still
+/// build). Kept as documentation of the old radius; no code reads it.
+pub const spawnNoClaimRadius: i32 = 0;
 pub const maxClaimsPerPlayer: u8 = 10;
 pub const maxMembers: u8 = 16;
 pub const barrierBlocks: i32 = 8;
@@ -128,7 +132,10 @@ pub fn isMember(c: *const Claim, user: *User) bool {
 		return std.mem.eql(u8, key, uk);
 	}
 	// Alliance members can build/open on the leader's claims.
-	return main.server.alliances.isMemberOf(c.owner, user.playerIndex, user.newKeyString orelse "");
+	if (main.server.alliances.isMemberOf(c.owner, user.playerIndex, user.newKeyString orelse "")) return true;
+	// Mutual alliance land: anyone in the same alliance builds on anyone's
+	// claims (leader↔member and member↔member), key-verified.
+	return main.server.alliances.inSameAlliance(user.playerIndex, user.newKeyString orelse "", c.owner);
 }
 
 /// Order: (x, vertical, z).
@@ -256,6 +263,7 @@ pub const CreateResult = union(enum) {
 	tooMany,
 	blocked: usize, // index of the blocking claim's owner
 	alreadyOwned,
+	spawnProtected,
 	invalidPosition,
 };
 
@@ -383,6 +391,18 @@ pub fn create(user: *User) CreateResult {
 	var maxZ = minZ + cellZ - 1;
 	const minY = py - halfY;
 	const maxY = py + halfY - 1;
+
+	// Spawn used to be unclaimable; that rule is removed (spawnNoClaimRadius is
+	// 0) so alliances can claim spawn. The branch is kept so the intent stays
+	// visible; with radius 0 it only matches a claim exactly on the spawn
+	// point column, which is harmless.
+	if (!isExempt(user) and spawnNoClaimRadius > 0) {
+		const world = main.server.world orelse return .invalidPosition;
+		const sx = world.spawn[0];
+		const sz = world.spawn[1];
+		if (maxX >= sx - spawnNoClaimRadius and minX <= sx + spawnNoClaimRadius and
+			maxZ >= sz - spawnNoClaimRadius and minZ <= sz + spawnNoClaimRadius) return .spawnProtected;
+	}
 
 	if (@as(u16, countOwned(user.playerIndex)) >= main.server.alliances.maxClaimsFor(user.playerIndex)) return .tooMany;
 
@@ -719,7 +739,11 @@ fn ownedBySame(c: *const Claim, ox: i32, oz: i32) bool {
 	return claims.items[i].owner == c.owner;
 }
 
-fn drawOutline(user: *User, index: usize, particle: []const u8, zon: []const u8, skipShared: bool) void {
+/// Vertical step for corner columns. Every 2 blocks keeps the sides readable
+/// without flooding packets (a full-height claim = 16 bursts per corner).
+const verticalStep: i32 = 2;
+
+fn drawOutline(user: *User, index: usize, particle: []const u8, zon: []const u8, skipShared: bool, vertical: bool) void {
 	ensure();
 	if (index >= claims.items.len) return;
 	const world = main.server.world orelse return;
@@ -739,17 +763,46 @@ fn drawOutline(user: *User, index: usize, particle: []const u8, zon: []const u8,
 		if (!(skipShared and ownedBySame(c, c.minX - 1, z))) edgePoint(user, world, particle, zon, c.minX, z, feet);
 		if (!(skipShared and ownedBySame(c, c.maxX + 1, z))) edgePoint(user, world, particle, zon, c.maxX, z, feet);
 	}
+	if (!vertical) return;
+	// Full 3D outline: corner columns at absolute claim Y (no ground snap, so
+	// the sides read correctly even on uneven terrain) plus the same edge walk
+	// repeated as a top panel at maxY + 1.
+	var y = c.minY;
+	while (true) {
+		burst(user, particle, zon, c.minX, c.minZ, y);
+		burst(user, particle, zon, c.maxX, c.minZ, y);
+		burst(user, particle, zon, c.minX, c.maxZ, y);
+		burst(user, particle, zon, c.maxX, c.maxZ, y);
+		if (y >= c.maxY) break;
+		y += verticalStep;
+		if (y > c.maxY) y = c.maxY;
+	}
+	var tx = c.minX;
+	while (true) {
+		burst(user, particle, zon, tx, c.minZ, c.maxY + 1);
+		burst(user, particle, zon, tx, c.maxZ, c.maxY + 1);
+		if (tx >= c.maxX) break;
+		tx += edgeStep;
+		if (tx > c.maxX) tx = c.maxX;
+	}
+	var tz = c.minZ + edgeStep;
+	while (tz < c.maxZ) : (tz += edgeStep) {
+		burst(user, particle, zon, c.minX, tz, c.maxY + 1);
+		burst(user, particle, zon, c.maxX, tz, c.maxY + 1);
+	}
 }
 
-/// Green/white outline for the claim you're viewing. Shared walls between your
-/// own adjoining claims are left empty, so only the outer boundary shows.
+/// Full 3D outline for the claim you're viewing: ground loop plus corner
+/// columns and a top panel. Shared walls between your own adjoining claims
+/// are left empty, so only the outer boundary shows.
 pub fn drawBorder(user: *User, index: usize) void {
-	drawOutline(user, index, borderParticle, borderSpawnZon, true);
+	drawOutline(user, index, borderParticle, borderSpawnZon, true, true);
 }
 
 /// Red outline marking a claim that blocks you, so you can see where it is.
+/// Flat only (no verticals), to bound packets in dense areas.
 pub fn drawBlocked(user: *User, index: usize) void {
-	drawOutline(user, index, blockedParticle, blockedSpawnZon, false);
+	drawOutline(user, index, blockedParticle, blockedSpawnZon, false, false);
 }
 
 const NearbyClaim = struct { dist: i64, index: usize };
@@ -786,12 +839,14 @@ pub fn drawNearby(user: *User, radius: i32) void {
 	}
 	for (chosen[0..chosenCount]) |e| {
 		const c = &claims.items[e.index];
+		// Nearby outlines stay flat so a dense area can't flood packets; the
+		// full 3D box is reserved for your own `/claim show`.
 		if (ownsClaim(c, user)) {
-			drawOutline(user, e.index, borderParticle, borderSpawnZon, true);
+			drawOutline(user, e.index, borderParticle, borderSpawnZon, true, false);
 		} else if (isMember(c, user)) {
-			drawOutline(user, e.index, friendParticle, borderSpawnZon, true);
+			drawOutline(user, e.index, friendParticle, borderSpawnZon, true, false);
 		} else {
-			drawOutline(user, e.index, blockedParticle, blockedSpawnZon, true);
+			drawOutline(user, e.index, blockedParticle, blockedSpawnZon, true, false);
 		}
 	}
 }

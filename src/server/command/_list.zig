@@ -32,6 +32,7 @@ pub const delhome = @import("delhome.zig");
 pub const homes = @import("homes.zig");
 pub const waypoint = @import("waypoint.zig");
 pub const unban = @import("unban.zig");
+pub const unstrike = @import("unstrike.zig");
 pub const ban = @import("ban.zig");
 pub const bans = @import("bans.zig");
 pub const skyscan = @import("skyscan.zig");

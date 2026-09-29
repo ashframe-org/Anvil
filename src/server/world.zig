@@ -358,7 +358,14 @@ pub const ChunkManager = struct { // MARK: ChunkManager
 	}
 
 	pub fn generateChunk(pos: ChunkPosition, source: Source) void { // MARK: generateChunk()
+		// --- ASHFRAME CUSTOM (NET-001: gen-time observability) ---
+		// Measures materialize time including cache hits (which show as ~0),
+		// i.e. what each chunk send costs the pool, not pure terrain gen.
+		const genT0 = main.timestamp();
 		const ch = getOrGenerateChunkAndIncreaseRefCount(pos);
+		const genNs = genT0.durationTo(main.timestamp()).toNanoseconds();
+		main.server.metrics.noteChunkGenUs(@intCast(@max(0, @divTrunc(genNs, 1000))));
+		// --- ASHFRAME CUSTOM (NET-001) ---
 		switch (source) {
 			.player => |player| {
 				const user = server.getUserByIndex(player) orelse return;
@@ -1307,6 +1314,7 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 			server.shops.autosave(self.path);
 			server.anticheat.autosave(self.path);
 			server.report.autosave(self.path);
+			server.waypoints.autosave(self.path);
 			// --- ASHFRAME CUSTOM (Progress) ---
 		}
 
@@ -1314,6 +1322,11 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 		// Flush queued item refunds outside of command processing.
 		server.progress.processRefunds();
 		// --- ASHFRAME CUSTOM (Deferred refunds) ---
+		// --- ASHFRAME CUSTOM (Sign shops) ---
+		// Re-render shop signs with sign-aware colors (throttled, stops when
+		// done). Covers signs whose chunks weren't loaded at startup.
+		server.shops.refreshTick();
+		// --- ASHFRAME CUSTOM (Sign shops) ---
 
 		// Store chunks and regions.
 		// Stores at least one chunk and one region per iteration.

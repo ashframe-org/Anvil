@@ -75,7 +75,13 @@ pub const client = struct { // MARK: client
 
 		mutex.lock();
 		defer mutex.unlock();
-		cmd.do(main.globalAllocator, .client, null, main.game.Player.gamemode.raw) catch unreachable;
+		// Never trap the client on its own optimistic command: if the local
+		// state can't apply it (e.g. a desynced slot), drop it unsent instead
+		// of panicking. The server is authoritative and will correct us.
+		cmd.do(main.globalAllocator, .client, null, main.game.Player.gamemode.raw) catch |err| {
+			std.log.warn("Dropping optimistic command the client can't apply: {s}", .{@errorName(err)});
+			return;
+		};
 		const data = cmd.serializePayload(main.stackAllocator);
 		defer main.stackAllocator.free(data);
 		main.network.protocols.inventory.sendCommand(main.game.world.?.conn, cmd.payload, data);
@@ -106,10 +112,16 @@ pub const client = struct { // MARK: client
 			var reader = BinaryReader.init(sync.data);
 
 			switch (sync.typ) {
-				.confirmation => {
-					if (tempData.popOrNull()) |_cmd| {
-						var cmd = _cmd;
-						cmd.do(main.globalAllocator, .client, null, main.game.Player.gamemode.raw) catch unreachable;
+			.confirmation => {
+				if (tempData.popOrNull()) |_cmd| {
+					var cmd = _cmd;
+					// Never trap the client on a command replay it can't apply
+					// (e.g. a container that unloaded mid-open): skip it like
+					// any other invalid sync instead of disconnecting.
+					cmd.do(main.globalAllocator, .client, null, main.game.Player.gamemode.raw) catch |err| {
+						std.log.warn("Ignoring un-appliable confirmation sync: {s}", .{@errorName(err)});
+						continue;
+					};
 						cmd.finalize(main.globalAllocator, .client, &reader) catch |err| {
 							std.log.warn("Ignoring invalid confirmation sync: {s}", .{@errorName(err)});
 							continue;
@@ -146,7 +158,10 @@ pub const client = struct { // MARK: client
 
 		while (tempData.popOrNull()) |_cmd| {
 			var cmd = _cmd;
-			cmd.do(main.globalAllocator, .client, null, main.game.Player.gamemode.raw) catch unreachable;
+			cmd.do(main.globalAllocator, .client, null, main.game.Player.gamemode.raw) catch |err| {
+				std.log.warn("Dropping un-reappliable command on sync: {s}", .{@errorName(err)});
+				continue;
+			};
 			commands.pushBack(cmd);
 		}
 	}
@@ -164,7 +179,10 @@ pub const client = struct { // MARK: client
 		}
 		while (tempData.popOrNull()) |_cmd| {
 			var cmd = _cmd;
-			cmd.do(main.globalAllocator, .client, null, gamemode) catch unreachable;
+			cmd.do(main.globalAllocator, .client, null, gamemode) catch |err| {
+				std.log.warn("Dropping un-reappliable command on gamemode change: {s}", .{@errorName(err)});
+				continue;
+			};
 			commands.pushBack(cmd);
 		}
 	}
@@ -868,6 +886,24 @@ pub const Command = struct { // MARK: Command
 						info.target.?.player().health = info.target.?.player().maxHealth;
 						info.cause.sendMessage(info.target.?.name);
 
+						// --- ASHFRAME CUSTOM (/back on death) ---
+						// Death teleports the client to spawn via the kill op
+						// below, which records nothing — so /back had no death
+						// spot (or a stale one near spawn) to return to. Capture
+						// the real death position now, before the kill op moves
+						// them. prof.pos is the interpolated server position,
+						// current to within ~a tick of movement.
+						info.target.?.player().back_pos = info.target.?.player().pos;
+						// --- ASHFRAME CUSTOM (/back on death) ---
+
+						// --- ASHFRAME CUSTOM (Respawn grace) ---
+						// Death teleports the client to spawn via the kill op
+						// without going through sendTPCoordinates, so grant the
+						// teleport grace window here or every respawn pings the
+						// movement anticheat.
+						main.server.anticheat.expectTeleport(info.target.?);
+						// --- ASHFRAME CUSTOM (Respawn grace) ---
+
 						self.syncOperations.append(allocator, .{.kill = .{
 							.target = info.target.?,
 							.spawnPoint = info.target.?.getSpawnPos(),
@@ -925,6 +961,19 @@ pub const Command = struct { // MARK: Command
 		}
 	};
 
+	// --- ASHFRAME CUSTOM (Sign shops: menu clicks) ---
+	/// If either side of an inventory operation is a shop confirmation menu,
+	/// treat the click as a buy/cancel and report it as handled. The caller
+	/// must then return `error.serverFailure` so the client reverts its
+	/// optimistic marker move (the menu never really changes).
+	fn interceptShopMenu(ctx: Context, a: InventoryAndSlot, b: InventoryAndSlot) bool {
+		if (ctx.side != .server or ctx.user == null) return false;
+		if (a.inv.source == .shopMenu and main.server.shops.handleMenuClick(ctx.user.?, a.inv.source.shopMenu, a.slot)) return true;
+		if (b.inv.source == .shopMenu and main.server.shops.handleMenuClick(ctx.user.?, b.inv.source.shopMenu, b.slot)) return true;
+		return false;
+	}
+	// --- ASHFRAME CUSTOM (Sign shops) ---
+
 	/// Largest inventory a client may ask to open. Real ones are far smaller
 	/// (chest 20), so anything bigger is malformed/hostile.
 	const maxInventorySize: u64 = 256;
@@ -964,6 +1013,11 @@ pub const Command = struct { // MARK: Command
 					writer.writeEnum(main.entity.Entity, val.playerId);
 					val.proceduralItemIndex.toBytes(writer);
 				},
+				.shopMenu => |val| {
+					// Only ever serialized client->server, and a vanilla client
+					// never sends it; written for completeness.
+					writer.writeVec(Vec3i, val);
+				},
 				.other => {},
 				.alreadyFreed => unreachable,
 			}
@@ -980,6 +1034,9 @@ pub const Command = struct { // MARK: Command
 				.hand => .{.hand = try reader.readEnum(main.entity.Entity)},
 				.blockInventory => .{.blockInventory = try reader.readVec(Vec3i)},
 				.workbench => .{.workbench = .{.playerId = try reader.readEnum(main.entity.Entity), .proceduralItemIndex = try .fromBytes(reader)}},
+				// A vanilla client never sends this: shop menus are created and
+				// attached server-side. Reject if it ever arrives from a client.
+				.shopMenu => return error.Invalid,
 				.other => .{.other = {}},
 				.alreadyFreed => return error.Invalid,
 			};
@@ -1001,10 +1058,21 @@ pub const Command = struct { // MARK: Command
 				if (!main.server.anticheat.checkReach(user.?, .{p[0], p[1], p[2]})) return error.InventoryNotFound;
 				// --- ASHFRAME CUSTOM (Anticheat) ---
 				// --- ASHFRAME CUSTOM (Sign shops) ---
-				// A non-owner clicking a shop chest buys instead of opening it.
-				if (main.server.shops.handleChestOpen(user.?, p)) {
-					return error.InventoryNotFound;
-				}
+				// A non-owner clicking a shop chest does NOT see the chest: they
+				// get a shared confirmation menu (green = buy, red = cancel).
+				if (main.server.shops.handleChestOpen(user.?, p)) |opened| switch (opened) {
+					.menu => |chest| {
+						const menuId = main.server.shops.openMenu(chest) orelse {
+							user.?.sendMessage("#e6312cThis shop is unavailable.", .{});
+							return error.InventoryNotFound;
+						};
+						try Inventory.server.createInventory(user.?, id, len, .{.shopMenu = chest});
+						return .{
+							.inv = Inventory.server.getInventoryFromId(menuId),
+							.source = .{.shopMenu = chest},
+						};
+					},
+				};
 				// --- ASHFRAME CUSTOM (Sign shops) ---
 				if (!main.server.claims.canBuild(user.?, p[0], p[2], p[1]) and
 					!main.server.claims.allianceChestPublic(p[0], p[2], p[1]))
@@ -1055,13 +1123,20 @@ pub const Command = struct { // MARK: Command
 		source: InventoryAndSlot,
 
 		fn run(self: DepositOrSwap, ctx: Context) error{serverFailure}!void {
-			if (self.dest.inv.callbacks.canPutInto) |c| if (!c(self.dest.inv.source, self.source.ref().item, self.dest.slot)) return;
+			// --- ASHFRAME CUSTOM (Sign shops: menu clicks) ---
+			// A click involving a shop menu is a buy/cancel, never a real swap.
+			// Fail so the client reverts its optimistic marker move.
+			if (interceptShopMenu(ctx, self.dest, self.source)) return error.serverFailure;
+			// --- ASHFRAME CUSTOM (Sign shops) ---
+			// Rejections must fail, not silently succeed: success confirms the
+			// client's optimistic change for something the server didn't do.
+			if (self.dest.inv.callbacks.canPutInto) |c| if (!c(self.dest.inv.source, self.source.ref().item, self.dest.slot)) return error.serverFailure;
 
 			const itemDest = self.dest.ref().item;
 			const itemSource = self.source.ref().item;
 			if (itemDest != .null and itemSource != .null) {
 				if (std.meta.eql(itemDest, itemSource)) {
-					if (self.dest.ref().amount >= itemDest.stackSize()) return;
+					if (self.dest.ref().amount >= itemDest.stackSize()) return error.serverFailure;
 					const amount = @min(itemDest.stackSize() - self.dest.ref().amount, self.source.ref().amount);
 					ctx.execute(.{.move = .{
 						.dest = self.dest,
@@ -1072,7 +1147,7 @@ pub const Command = struct { // MARK: Command
 				}
 			}
 
-			if (self.source.inv.callbacks.canPutInto) |c| if (!c(self.source.inv.source, self.dest.ref().item, self.source.slot)) return;
+			if (self.source.inv.callbacks.canPutInto) |c| if (!c(self.source.inv.source, self.dest.ref().item, self.source.slot)) return error.serverFailure;
 			ctx.execute(.{.swap = .{
 				.dest = self.dest,
 				.source = self.source,
@@ -1097,9 +1172,13 @@ pub const Command = struct { // MARK: Command
 		source: InventoryAndSlot,
 
 		fn run(self: Swap, ctx: Context) error{serverFailure}!void {
+			// --- ASHFRAME CUSTOM (Sign shops: menu clicks) ---
+			if (interceptShopMenu(ctx, self.dest, self.source)) return error.serverFailure;
+			// --- ASHFRAME CUSTOM (Sign shops) ---
 			if (self.dest.inv.id == self.source.inv.id and self.dest.slot == self.source.slot) return;
-			if (self.dest.inv.callbacks.canPutInto) |c| if (!c(self.dest.inv.source, self.source.ref().item, self.dest.slot)) return;
-			if (self.source.inv.callbacks.canPutInto) |c| if (!c(self.source.inv.source, self.dest.ref().item, self.source.slot)) return;
+			// Rejections must fail, not silently succeed (see DepositOrSwap).
+			if (self.dest.inv.callbacks.canPutInto) |c| if (!c(self.dest.inv.source, self.source.ref().item, self.dest.slot)) return error.serverFailure;
+			if (self.source.inv.callbacks.canPutInto) |c| if (!c(self.source.inv.source, self.dest.ref().item, self.source.slot)) return error.serverFailure;
 			ctx.execute(.{.swap = .{
 				.dest = self.dest,
 				.source = self.source,
@@ -1125,13 +1204,17 @@ pub const Command = struct { // MARK: Command
 		amount: u16,
 
 		fn run(self: Deposit, ctx: Context) error{serverFailure}!void {
-			if (self.dest.inv.callbacks.canPutInto) |c| if (!c(self.dest.inv.source, self.source.ref().item, self.dest.slot)) return;
+			// --- ASHFRAME CUSTOM (Sign shops: menu clicks) ---
+			if (interceptShopMenu(ctx, self.dest, self.source)) return error.serverFailure;
+			// --- ASHFRAME CUSTOM (Sign shops) ---
+			// Rejections must fail, not silently succeed (see DepositOrSwap).
+			if (self.dest.inv.callbacks.canPutInto) |c| if (!c(self.dest.inv.source, self.source.ref().item, self.dest.slot)) return error.serverFailure;
 			const itemSource = self.source.ref().item;
 			if (itemSource == .null) return;
 			const itemDest = self.dest.ref().item;
 			if (itemDest != .null) {
 				if (std.meta.eql(itemDest, itemSource)) {
-					if (self.dest.ref().amount >= itemDest.stackSize()) return;
+					if (self.dest.ref().amount >= itemDest.stackSize()) return error.serverFailure;
 					const amount = @min(itemDest.stackSize() - self.dest.ref().amount, self.source.ref().amount, self.amount);
 					ctx.execute(.{.move = .{
 						.dest = self.dest,
@@ -1169,7 +1252,11 @@ pub const Command = struct { // MARK: Command
 		source: InventoryAndSlot,
 
 		fn run(self: TakeHalf, ctx: Context) error{serverFailure}!void {
-			if (self.dest.inv.callbacks.canPutInto) |c| if (!c(self.dest.inv.source, self.source.ref().item, self.dest.slot)) return;
+			// --- ASHFRAME CUSTOM (Sign shops: menu clicks) ---
+			if (interceptShopMenu(ctx, self.dest, self.source)) return error.serverFailure;
+			// --- ASHFRAME CUSTOM (Sign shops) ---
+			// Rejections must fail, not silently succeed (see DepositOrSwap).
+			if (self.dest.inv.callbacks.canPutInto) |c| if (!c(self.dest.inv.source, self.source.ref().item, self.dest.slot)) return error.serverFailure;
 
 			const itemSource = self.source.ref().item;
 			if (itemSource == .null) return;
@@ -1177,7 +1264,7 @@ pub const Command = struct { // MARK: Command
 			const itemDest = self.dest.ref().item;
 			if (itemDest != .null) {
 				if (std.meta.eql(itemDest, itemSource)) {
-					if (self.dest.ref().amount >= itemDest.stackSize()) return;
+					if (self.dest.ref().amount >= itemDest.stackSize()) return error.serverFailure;
 					const amount = @min(itemDest.stackSize() - self.dest.ref().amount, desiredAmount);
 					ctx.execute(.{.move = .{
 						.dest = self.dest,
@@ -1246,12 +1333,13 @@ pub const Command = struct { // MARK: Command
 		amount: u16 = 0,
 
 		fn run(self: FillFromCreative, ctx: Context) error{serverFailure}!void {
-			if (self.dest.inv.callbacks.canPutInto) |c| if (!c(self.dest.inv.source, self.item, self.dest.slot)) return;
+			if (self.dest.inv.callbacks.canPutInto) |c| if (!c(self.dest.inv.source, self.item, self.dest.slot)) return error.serverFailure;
 			if (ctx.gamemode != .creative) {
-				// --- ASHFRAME CUSTOM (Anticheat): client claims creative while the
-				// server says otherwise (a modified/creative-forced client). ---
-				if (ctx.user) |u| main.server.anticheat.note(u, .protocol, "creative item fill while not creative");
-				return;
+				// A non-creative fill is a desync (or a modified client), not
+				// a crime: fail so the client reverts. Sustained attempts count
+				// toward the creative-op abuse kick.
+				if (ctx.side == .server and ctx.user != null) main.server.anticheat.noteCreativeOp(ctx.user.?, "creative fill as survival");
+				return error.serverFailure;
 			}
 
 			if (!self.dest.ref().empty()) {
@@ -1321,9 +1409,11 @@ pub const Command = struct { // MARK: Command
 
 		fn run(self: FillAnyFromCreative, ctx: Context) error{serverFailure}!void {
 			if (ctx.gamemode != .creative) {
-				// --- ASHFRAME CUSTOM (Anticheat) ---
-				if (ctx.user) |u| main.server.anticheat.note(u, .protocol, "creative item fill while not creative");
-				return;
+				// A non-creative fill is a desync (or a modified client), not
+				// a crime: fail so the client reverts. Sustained attempts count
+				// toward the creative-op abuse kick.
+				if (ctx.side == .server and ctx.user != null) main.server.anticheat.noteCreativeOp(ctx.user.?, "creative fill-any as survival");
+				return error.serverFailure;
 			}
 			// --- ASHFRAME CUSTOM (Anticheat): clamp client amount to a legal stack.
 			const amount: u16 = if (self.item == .null) self.amount else @min(self.amount, self.item.stackSize());
@@ -1439,7 +1529,9 @@ pub const Command = struct { // MARK: Command
 		fn run(self: DepositToAny, ctx: Context) error{serverFailure}!void {
 			const sourceStack = self.source.ref();
 			if (sourceStack.item == .null) return;
-			if (self.amount > sourceStack.amount) return;
+			// The client thought it held more than it does: fail so it reverts
+			// instead of confirming a move the server didn't make.
+			if (self.amount > sourceStack.amount) return error.serverFailure;
 
 			_ = self.destinations.putItemsInto(ctx, self.amount, .{.move = self.source});
 		}
@@ -1553,7 +1645,9 @@ pub const Command = struct { // MARK: Command
 		}
 
 		fn run(self: CraftFrom, ctx: Context) error{serverFailure}!void {
-			if (self.destinations.canHold(.{.item = .{.baseItem = self.recipe.resultItem}, .amount = self.recipe.resultAmount}) != .yes) return;
+			// Craft rejections must fail, not silently succeed: success would
+			// confirm ingredients the server never consumed / results never made.
+			if (self.destinations.canHold(.{.item = .{.baseItem = self.recipe.resultItem}, .amount = self.recipe.resultAmount}) != .yes) return error.serverFailure;
 
 			// Can we even craft it?
 			outer: for (self.recipe.sourceItems) |requiredItem| {
@@ -1571,7 +1665,7 @@ pub const Command = struct { // MARK: Command
 					}
 				}
 				// Not enough ingredients
-				if (amount != 0) return;
+				if (amount != 0) return error.serverFailure;
 			}
 
 			for (self.recipe.sourceItems, self.recipe.sourceAmounts) |requiredItem, requiredAmount| {
@@ -1616,9 +1710,10 @@ pub const Command = struct { // MARK: Command
 
 		fn run(self: CraftProceduralItem, ctx: Context) error{serverFailure}!void {
 			const proceduralItem = Item{.proceduralItem = main.items.ProceduralItem.initFromInventory(self.craftingGrid) orelse return};
+			// Fail (client reverts) rather than confirming a craft that never happened.
 			if (self.destinations.canHold(.{.item = proceduralItem, .amount = 1}) != .yes) {
 				proceduralItem.deinit();
-				return;
+				return error.serverFailure;
 			}
 			ctx.cmd.removeProceduralItemCraftingIngredients(main.globalAllocator, self.craftingGrid, ctx.side);
 			_ = self.destinations.putItemsInto(ctx, 1, .{.create = proceduralItem});
@@ -1709,7 +1804,11 @@ pub const Command = struct { // MARK: Command
 
 					const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
 					main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
-					return;
+					// Must fail, not silently succeed: success sends a
+					// confirmation that finalizes the client's optimistic item
+					// consume, eating the held item for a reverted block.
+					// Failure makes the client restore it.
+					return error.serverFailure;
 				}
 			}
 			// --- ASHFRAME CUSTOM (Land claims) ---
@@ -1721,7 +1820,9 @@ pub const Command = struct { // MARK: Command
 					defer writer.deinit();
 					const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
 					main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
-					return;
+					// Fail (restores the held item client-side), don't
+					// silently confirm. See the claims branch above.
+					return error.serverFailure;
 				}
 			}
 			// --- ASHFRAME CUSTOM (Anticheat) ---
@@ -1735,7 +1836,8 @@ pub const Command = struct { // MARK: Command
 						defer writer.deinit();
 						const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
 						main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
-						return;
+						// Fail so the held item is restored, not consumed.
+						return error.serverFailure;
 					}
 				}
 			}
@@ -1750,7 +1852,8 @@ pub const Command = struct { // MARK: Command
 					const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
 					main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
 					u.sendMessage("#e6312cThe return core can't be broken.", .{});
-					return;
+					// Fail so the held item is restored, not consumed.
+					return error.serverFailure;
 				}
 			}
 			// --- ASHFRAME CUSTOM (Shrines) ---
@@ -1763,13 +1866,18 @@ pub const Command = struct { // MARK: Command
 					const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
 					main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
 					u.sendMessage("#e6312cThis is someone else's shop.", .{});
-					return;
+					// Fail so the held item is restored, not consumed.
+					return error.serverFailure;
 				}
 			}
 			if (self.newBlock.typ != self.oldBlock.typ) {
 				main.server.shops.onBroken(.{pos[0], pos[1], pos[2]}, self.oldBlock);
 			}
 			// --- ASHFRAME CUSTOM (Sign shops) ---
+			// NOTE: break-time (instant-break) enforcement was tried here and
+			// REMOVED: legitimate god-tier pickaxes break fast enough to trip
+			// any timing model, and lag batches false-positive. Break speed is
+			// not policed; cost/claims/reach above still are.
 		}
 
 			if (ctx.side == .server) {
@@ -1920,7 +2028,15 @@ pub const Command = struct { // MARK: Command
 
 				if (target == null) return error.serverFailure;
 
-				if (target.?.gamemode.raw == .creative) return;
+				if (target.?.gamemode.raw == .creative) {
+					// --- ASHFRAME CUSTOM (Immortal-player diagnostic) ---
+					// Damage reports for a player the server thinks is creative
+					// are silently skipped: the client already drained its own
+					// health display, so it sits at 0 HP forever with no death.
+					// Log it so a gamemode desync is visible instead of silent.
+					std.log.warn("[ashframe] skipped damage for {s}: server thinks they are in creative (gamemode desync?)", .{target.?.name});
+					return;
+				}
 			} else {
 				if (main.game.Player.gamemode.raw == .creative) return;
 			}

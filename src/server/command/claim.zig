@@ -35,11 +35,9 @@ pub fn execute(args: Args, source: Source) void {
 	const user = source.user;
 	switch (args) {
 		.@"/claim" => {
-			// A member's slots belong to their alliance; they can't claim here.
-			if (main.server.alliances.isMember(user.playerIndex)) {
-				source.sendMessage("#e6312cYou're in an alliance — #cfcfcf/alliance leave#e6312c before claiming your own land.", .{});
-				return;
-			}
+			// Alliance members keep full personal claim rights (their unused
+			// slots pool to the leader dynamically); joining no longer freezes
+			// them out of claiming.
 			// Charge BEFORE creating, and refund on any failure. This avoids
 			// appending a claim and then freeing it again on a failed payment
 			// (a fragile path that could double-free).
@@ -71,6 +69,10 @@ pub fn execute(args: Args, source: Source) void {
 				.alreadyOwned => {
 					if (cost.amount > 0) ashutil.refundItem(user, cost.item, cost.amount);
 					source.sendMessage("#e6312cYou're already standing inside your own claim.", .{});
+				},
+				.spawnProtected => {
+					if (cost.amount > 0) ashutil.refundItem(user, cost.item, cost.amount);
+					source.sendMessage("#e6312cThis is the spawn area — nobody can claim here, but building and shops work.", .{});
 				},
 				.blocked => |blocker| {
 					if (cost.amount > 0) ashutil.refundItem(user, cost.item, cost.amount);

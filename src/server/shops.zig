@@ -20,6 +20,18 @@ const BaseItemIndex = main.items.BaseItemIndex;
 /// reserve: the owner is warned, and a trade is refused if the chest is full.
 pub const reservedSlots: usize = 2;
 
+// --- ASHFRAME CUSTOM (Sign shops: confirmation menu) ---
+// A customer clicking a shop chest does NOT see the chest. The server opens a
+// shareable 20-slot "menu" inventory instead, holding only two markers: a green
+// block the customer clicks to buy, and a red block to cancel. The customer's
+// slot click arrives as a normal inventory command, which we intercept by
+// inventory source + slot; nothing else in the menu is movable.
+pub const menuSize: usize = 20;
+/// Menu slots the customer clicks. Anything else is rejected.
+pub const menuGreenSlot: usize = 0; // buy (0-indexed: first slot)
+pub const menuRedSlot: usize = 9; // cancel (0-indexed: tenth slot)
+// --- ASHFRAME CUSTOM (Sign shops) ---
+
 const signType = main.block_entity.BlockEntityTypes.@"cubyz:sign";
 
 pub const Mode = enum { sell, buy };
@@ -108,6 +120,22 @@ pub fn resolveItem(str: []const u8) ?BaseItemIndex {
 	return null;
 }
 
+/// True for sign woods pale enough that the standard yellow/white shop text
+/// washes out (measured texture luminance; threshold ~130: baobab, birch,
+/// palm). All other woods — and unknown/addon signs — use the light scheme.
+/// Signs render text with no shadow/outline, so contrast with the wood is the
+/// only thing keeping text readable.
+pub fn schemeForId(id: []const u8) bool {
+	return std.mem.endsWith(u8, id, "sign/baobab") or
+		std.mem.endsWith(u8, id, "sign/birch") or
+		std.mem.endsWith(u8, id, "sign/palm");
+}
+
+/// True if `block` is a pale sign needing the dark text scheme.
+pub fn signIsLight(block: main.blocks.Block) bool {
+	return schemeForId(block.id());
+}
+
 /// Max bytes of a player's (visible) name stored on a shop sign, so long names
 /// don't overflow the sign.
 pub const maxNameLen: usize = 16;
@@ -135,11 +163,30 @@ pub fn signName(name: []const u8, buf: *[maxNameLen]u8) []const u8 {
 /// it stands out; the color code is stripped when rendered, so it costs no space.
 /// Lines 2-3 are from the customer's point of view (`-` they give, `+` they get),
 /// and list the price first, then the goods.
-pub fn formatSignText(mode: Mode, amount: u16, goods: BaseItemIndex, priceAmount: u16, price: BaseItemIndex, ownerName: []const u8, buf: []u8) ![]const u8 {
+/// `lightSign` selects the text scheme: pale woods get black text (yellow and
+/// white are unreadable on them), dark woods keep yellow-on-white.
+pub fn formatSignText(mode: Mode, amount: u16, goodsName: []const u8, priceAmount: u16, priceName: []const u8, ownerName: []const u8, lightSign: bool, buf: []u8) ![]const u8 {
 	const modeName = if (mode == .sell) "Sell" else "Buy";
 	const priceSign = if (mode == .sell) "-" else "+";
 	const goodsSign = if (mode == .sell) "+" else "-";
-	return std.fmt.bufPrint(buf, "#ffcc00[Shop] {s}#ffffff\n{s}{d}x {s}\n{s}{d}x {s}\n{s}", .{modeName, priceSign, priceAmount, shortId(price), goodsSign, amount, shortId(goods), ownerName});
+	if (lightSign) {
+		return std.fmt.bufPrint(buf, "#000000[Shop] {s}#000000\n{s}{d}x {s}\n{s}{d}x {s}\n{s}", .{modeName, priceSign, priceAmount, priceName, goodsSign, amount, goodsName, ownerName});
+	}
+	return std.fmt.bufPrint(buf, "#ffcc00[Shop] {s}#ffffff\n{s}{d}x {s}\n{s}{d}x {s}\n{s}", .{modeName, priceSign, priceAmount, priceName, goodsSign, amount, goodsName, ownerName});
+}
+
+/// Formats and writes a shop sign, picking the text scheme with contrast
+/// against the actual sign wood. Broadcasts the update. False when there is
+/// no loaded sign at `pos`.
+pub fn writeShopSign(sign: Vec3i, mode: Mode, amount: u16, goods: BaseItemIndex, priceAmount: u16, price: BaseItemIndex, ownerName: []const u8) bool {
+	const world = main.server.world orelse return false;
+	const block = world.getBlock(sign[0], sign[1], sign[2]) orelse return false;
+	if (!isSignBlock(block)) return false;
+	var buf: [256]u8 = undefined;
+	const text = formatSignText(mode, amount, shortId(goods), priceAmount, shortId(price), ownerName, signIsLight(block), &buf) catch return false;
+	if (!writeSign(sign, text)) return false;
+	main.network.protocols.blockEntityUpdate.sendServerDataUpdateToClients(sign);
+	return true;
 }
 
 /// Writes `text` into the sign at `pos` server-side. Returns false if there's
@@ -159,24 +206,60 @@ pub fn writeSign(pos: Vec3i, text: []const u8) bool {
 	return true;
 }
 
+/// A shop sign must be mounted on a horizontal (side) face of the chest, not
+/// merely adjacent. `cubyz:sign` stores its mounting direction in `block.data`
+/// (see mods/cubyz/rotations/sign.zig): 0..7 = ceiling, 8..15 = floor,
+/// 16..19 = side (dirNegX, dirNegY, dirPosX, dirPosY). World/shop coords here
+/// are (x, horizontal, vertical), matching chunk.Neighbor (relZ is vertical).
+/// Returns the block the sign is attached to, or null for floor/ceiling mounts
+/// and malformed data.
+fn signAttachmentPos(signPos: Vec3i, signBlock: main.blocks.Block) ?Vec3i {
+	const data = signBlock.data;
+	const off: Vec3i = switch (data) {
+		16 => .{-1, 0, 0}, // dirNegX
+		17 => .{0, -1, 0}, // dirNegY (horizontal)
+		18 => .{1, 0, 0}, // dirPosX
+		19 => .{0, 1, 0}, // dirPosY (horizontal)
+		else => return null, // floor/ceiling mount or invalid: not a valid shop sign
+	};
+	return .{signPos[0] + off[0], signPos[1] + off[1], signPos[2] + off[2]};
+}
+
+/// True if the sign at `signPos` is side-mounted directly on the block at
+/// `attachedPos`.
+fn signMountedOn(signPos: Vec3i, signBlock: main.blocks.Block, attachedPos: Vec3i) bool {
+	const attached = signAttachmentPos(signPos, signBlock) orelse return false;
+	return eq(.{attached[0], attached[1], attached[2]}, attachedPos);
+}
+
+/// The chest a sign is mounted on, or null if the sign isn't side-mounted on a
+/// chest. Only the sign's own mounting direction is consulted, so a sign on a
+/// neighbouring block that merely faces the chest does NOT qualify.
+pub fn mountedChestOfSign(signPos: Vec3i) ?Vec3i {
+	const world = main.server.world orelse return null;
+	const signBlock = world.getBlock(signPos[0], signPos[1], signPos[2]) orelse return null;
+	if (!isSignBlock(signBlock)) return null;
+	const attached = signAttachmentPos(signPos, signBlock) orelse return null;
+	const attachedBlock = world.getBlock(attached[0], attached[1], attached[2]) orelse return null;
+	if (!isChestBlock(attachedBlock)) return null;
+	return attached;
+}
+
+/// The sign mounted directly on `chest` (side mount only), or null.
 pub fn findNeighborSign(pos: Vec3i) ?Vec3i {
 	const world = main.server.world orelse return null;
 	for (neighbors) |n| {
 		const p = Vec3i{pos[0] + n.dx, pos[1] + n.dz, pos[2] + n.dv};
 		const block = world.getBlock(p[0], p[1], p[2]) orelse continue;
-		if (isSignBlock(block)) return p;
+		if (!isSignBlock(block)) continue;
+		if (signMountedOn(p, block, pos)) return p;
 	}
 	return null;
 }
 
 pub fn findNeighborChest(pos: Vec3i) ?Vec3i {
-	const world = main.server.world orelse return null;
-	for (neighbors) |n| {
-		const p = Vec3i{pos[0] + n.dx, pos[1] + n.dz, pos[2] + n.dv};
-		const block = world.getBlock(p[0], p[1], p[2]) orelse continue;
-		if (isChestBlock(block)) return p;
-	}
-	return null;
+	// The sign must be mounted on the chest it returns (side mount only).
+	return mountedChestOfSign(pos);
 }
 
 /// Simple ray-march from the player's eye along their look direction, returning
@@ -262,6 +345,8 @@ pub fn onBroken(pos: Vec3i, oldBlock: main.blocks.Block) void {
 	var i: usize = 0;
 	while (i < shops.items.len) {
 		if (eq(shops.items[i].chest, pos) or eq(shops.items[i].sign, pos)) {
+			// Drop any confirmation menus opened for this shop.
+			closeMenusAt(shops.items[i].chest);
 			main.globalAllocator.free(shops.items[i].owner);
 			_ = shops.swapRemove(i);
 			continue;
@@ -269,6 +354,20 @@ pub fn onBroken(pos: Vec3i, oldBlock: main.blocks.Block) void {
 		i += 1;
 	}
 	saveCurrentWorld();
+}
+
+/// Destroys any open confirmation menu for the given shop chest. Safe if none.
+fn closeMenusAt(chest: [3]i32) void {
+	ensureMenus();
+	var i: usize = 0;
+	while (i < menus.items.len) {
+		if (menus.items[i].chest[0] == chest[0] and menus.items[i].chest[1] == chest[1] and menus.items[i].chest[2] == chest[2]) {
+			Inventory.server.destroyExternallyManagedInventory(menus.items[i].invId);
+			_ = menus.swapRemove(i);
+			continue;
+		}
+		i += 1;
+	}
 }
 
 /// True if the sign at `pos` is a shop sign owned by someone other than `user`,
@@ -386,17 +485,25 @@ fn warnOwner(user: *User, chest: Vec3i) void {
 	}
 }
 
-fn doTrade(user: *User, shop: *const Shop) void {
+/// Executes a trade from the customer's side. Returns true on success (so the
+/// menu can close with a positive outcome), false if it was refused for any
+/// reason (the customer already got an explanatory message).
+fn doTrade(user: *User, shop: *const Shop) bool {
+	// Bisect toggle: economy frozen while off.
+	if (!main.settings.launchConfig.serverAuthoritativeCharges) {
+		user.sendMessage("#e6312cShops are temporarily disabled.", .{});
+		return false;
+	}
 	const goods: BaseItemIndex = @enumFromInt(shop.goodsItem);
 	const price: BaseItemIndex = @enumFromInt(shop.priceItem);
 
 	const playerInv = Inventory.server.getInventoryFromSource(.{.playerInventory = user.id}) orelse {
 		user.sendMessage("#e6312cCould not find your inventory.", .{});
-		return;
+		return false;
 	};
 	const chestInv = Inventory.server.getInventoryFromSource(.{.blockInventory = .{shop.chest[0], shop.chest[1], shop.chest[2]}}) orelse {
 		user.sendMessage("#e6312cThis shop is unavailable.", .{});
-		return;
+		return false;
 	};
 
 	// From the customer's point of view: what they hand over and what they get.
@@ -409,19 +516,19 @@ fn doTrade(user: *User, shop: *const Shop) void {
 		} else {
 			user.sendMessage("#e6312cThis shop can't pay out right now.", .{});
 		}
-		return;
+		return false;
 	}
 	if (countItem(playerInv, customerPays.item) < customerPays.amount) {
 		user.sendMessage("#e6312cYou need #e6312c{d} {s}#cfcfcf for this.", .{customerPays.amount, customerPays.item.name()});
-		return;
+		return false;
 	}
 	if (!canAdd(chestInv, customerPays.item, customerPays.amount)) {
 		user.sendMessage("#e6312cThis shop is full and can't accept the trade right now.", .{});
-		return;
+		return false;
 	}
 	if (!canAdd(playerInv, customerGets.item, customerGets.amount)) {
 		user.sendMessage("#e6312cYour inventory is too full to receive the items.", .{});
-		return;
+		return false;
 	}
 
 	removeItem(playerInv, customerPays.item, customerPays.amount);
@@ -430,21 +537,158 @@ fn doTrade(user: *User, shop: *const Shop) void {
 	addItem(playerInv, customerGets.item, customerGets.amount);
 
 	user.player().shopTrades +|= 1;
-	const verb = if (shop.mode == .sell) "Bought" else "Sold";
-	user.sendMessage("#00ff00{s} #e6312c{d} {s}#00ff00 for #e6312c{d} {s}#00ff00.", .{verb, shop.goodsAmount, goods.name(), shop.priceAmount, price.name()});
-}
-
-/// Called when a player opens a chest. Returns true if the open was intercepted
-/// (a non-owner trade attempt), meaning the chest must NOT open.
-pub fn handleChestOpen(user: *User, chest: Vec3i) bool {
-	const i = findAtChest(chest) orelse return false;
-	if (isOwner(user, &shops.items[i])) {
-		warnOwner(user, chest);
-		return false;
-	}
-	doTrade(user, &shops.items[i]);
+	// Always from the customer's point of view: "Bought <received> for <paid>".
+	// `customerGets` is what they receive, `customerPays` what they hand over.
+	var buf: [256]u8 = undefined;
+	const summary = tradeSummaryParts(
+		user.name,
+		customerGets.amount,
+		customerGets.item.name(),
+		customerPays.amount,
+		customerPays.item.name(),
+		&buf,
+	) catch "trade";
+	user.sendMessage("#00ff00{s}#00ff00.", .{summary});
+	notifyOwner(shop, summary);
 	return true;
 }
+
+/// Formats a completed trade from the buyer's point of view:
+/// "<buyer> bought <receivedCount> <receivedItem> for <paidCount> <paidItem>".
+/// Using the customer's actual give/take avoids the old bug where buy-shops
+/// (owner buys) reported the goods/price the wrong way around.
+fn tradeSummaryParts(buyerName: []const u8, receivedCount: u16, receivedName: []const u8, paidCount: u16, paidName: []const u8, buf: []u8) ![]const u8 {
+	return std.fmt.bufPrint(buf, "{s} bought {d} {s} for {d} {s}", .{ buyerName, receivedCount, receivedName, paidCount, paidName });
+}
+
+/// Tells the shop owner a sale happened. The online owner (matched by account
+/// key) gets a chat message; otherwise it is only logged (nothing to deliver to
+/// an offline player without mail). `summary` is the buyer-facing sentence so
+/// both sides agree on the direction.
+fn notifyOwner(shop: *const Shop, summary: []const u8) void {
+	std.log.info("[ashframe] shop sale: {s}", .{summary});
+	const userList = main.server.getUserList(main.stackAllocator);
+	defer main.stackAllocator.free(userList);
+	for (userList) |u| {
+		if (std.mem.eql(u8, ownerId(u), shop.owner)) {
+			u.sendMessage("#00ff00Sale! #cfcfcf{s}#00ff00.", .{summary});
+			return;
+		}
+	}
+}
+
+/// Called when a player opens a shop chest.
+/// Returns:
+///  - null  -> not a shop (open the chest normally)
+///  - menu  -> the customer should be shown the confirmation menu instead
+/// Owner opens the real chest (to restock); a customer gets the menu.
+pub const ChestOpen = union(enum) { menu: Vec3i };
+
+pub fn handleChestOpen(user: *User, chest: Vec3i) ?ChestOpen {
+	const i = findAtChest(chest) orelse return null;
+	if (isOwner(user, &shops.items[i])) {
+		warnOwner(user, chest);
+		return null;
+	}
+	return .{.menu = chest};
+}
+
+// --- ASHFRAME CUSTOM (Sign shops: confirmation menu) ---
+
+/// Menu inventories, keyed by shop chest position. Created on first open,
+/// shared by every customer currently deciding, destroyed when the last one
+/// closes.
+const Menu = struct {
+	chest: [3]i32,
+	invId: Inventory.InventoryId,
+};
+var menus: main.ListManaged(Menu) = undefined;
+var menusReady: bool = false;
+
+fn ensureMenus() void {
+	if (!menusReady) {
+		menus = main.ListManaged(Menu).init(main.globalAllocator);
+		menusReady = true;
+	}
+}
+
+fn findMenu(chest: Vec3i) ?usize {
+	ensureMenus();
+	for (menus.items, 0..) |m, i| {
+		if (m.chest[0] == chest[0] and m.chest[1] == chest[1] and m.chest[2] == chest[2]) return i;
+	}
+	return null;
+}
+
+/// Green "yes" marker and red "no" marker item ids. Falls back gracefully if an
+/// asset is missing (menu would be empty, so we refuse to show it).
+fn greenMarker() ?BaseItemIndex {
+	return BaseItemIndex.fromId("cubyz:chalk/green");
+}
+fn redMarker() ?BaseItemIndex {
+	return BaseItemIndex.fromId("cubyz:chalk/red");
+}
+
+fn menuLastClose(source: Inventory.Source) void {
+	// All customers have closed; tear the menu down. `source` is the menu pos.
+	if (source != .shopMenu) return;
+	const chest = source.shopMenu;
+	const i = findMenu(chest) orelse return;
+	const invId = menus.items[i].invId;
+	_ = menus.swapRemove(i);
+	Inventory.server.destroyExternallyManagedInventory(invId);
+}
+
+/// Returns the menu inventory id for `chest`, creating and populating it on
+/// first use. Null if the marker items are unavailable.
+pub fn openMenu(chest: Vec3i) ?Inventory.InventoryId {
+	ensureMenus();
+	if (findMenu(chest)) |i| return menus.items[i].invId;
+
+	const green = greenMarker() orelse return null;
+	const red = redMarker() orelse return null;
+
+	const callbacks = Inventory.Callbacks{.onLastCloseCallback = &menuLastClose};
+	var empty = main.utils.BinaryReader.init(&.{});
+	const invId = Inventory.server.createExternallyManagedInventory(menuSize, .{.shopMenu = chest}, &empty, callbacks);
+	const inv = Inventory.server.getInventoryFromId(invId);
+	setMenuSlot(inv, menuGreenSlot, green);
+	setMenuSlot(inv, menuRedSlot, red);
+
+	menus.append(.{.chest = .{chest[0], chest[1], chest[2]}, .invId = invId});
+	return invId;
+}
+
+fn setMenuSlot(inv: Inventory, slot: usize, item: BaseItemIndex) void {
+	main.sync.server.executeCommand(.{.fillFromCreative = .{
+		.dest = .{.inv = inv, .slot = @intCast(slot)},
+		.item = .{.baseItem = item},
+		.amount = 1,
+	}}, null);
+}
+
+/// Called from the inventory-command interception when a customer clicks a slot
+/// of a shop menu. `slot` is the clicked menu slot. Returns true if the click was
+/// consumed (the caller must not perform the physical swap).
+pub fn handleMenuClick(user: *User, menuPos: [3]i32, slot: usize) bool {
+	const chest: Vec3i = .{menuPos[0], menuPos[1], menuPos[2]};
+	if (slot == menuGreenSlot) {
+		if (findAtChest(chest)) |i| {
+			_ = doTrade(user, &shops.items[i]);
+		} else {
+			user.sendMessage("#e6312cThis shop no longer exists.", .{});
+		}
+		return true;
+	}
+	if (slot == menuRedSlot) {
+		user.sendMessage("#cfcfcfPurchase cancelled.", .{});
+		return true;
+	}
+	// Any other slot holds nothing meaningful: reject silently but consume it.
+	return true;
+}
+
+// --- ASHFRAME CUSTOM (Sign shops) ---
 
 // --- Persistence ---
 
@@ -467,6 +711,14 @@ pub fn load(worldPath: []const u8) void {
 	ensure();
 	for (shops.items) |s| main.globalAllocator.free(s.owner);
 	shops.clearRetainingCapacity();
+	// Any menus from a previous world are gone too.
+	ensureMenus();
+	while (menus.items.len != 0) {
+		Inventory.server.destroyExternallyManagedInventory(menus.pop().invId);
+	}
+	// Re-render every sign with the current (sign-aware) colors once chunks
+	// are available; see refreshTick.
+	refreshDone = false;
 	const path = filePath(main.stackAllocator, worldPath);
 	defer main.stackAllocator.free(path);
 	const zon = main.files.cubyzDir().readToZon(main.stackAllocator, path) catch return;
@@ -532,4 +784,141 @@ pub fn autosave(worldPath: []const u8) void {
 		save(worldPath);
 	}
 }
+
+var refreshDone: bool = true;
+var lastRefresh: std.Io.Timestamp = .{.nanoseconds = 0};
+
+/// Throttled driver for refreshSigns, called from the world tick. Attempts at
+/// most once a minute and stops once every sign is rewritten.
+pub fn refreshTick() void {
+	if (refreshDone) return;
+	const now = main.timestamp();
+	if (lastRefresh.durationTo(now).toSeconds() < 60) return;
+	lastRefresh = now;
+	_ = refreshSigns();
+}
+
+/// Rewrites every registered shop sign with the current (sign-aware) colors.
+/// Signs in unloaded chunks are skipped and retried on a later tick; returns
+/// the number still pending.
+pub fn refreshSigns() usize {
+	ensure();
+	var pending: usize = 0;
+	for (shops.items) |*s| {
+		if (!refreshOne(s)) pending += 1;
+	}
+	if (pending == 0 and !refreshDone) {
+		refreshDone = true;
+		std.log.info("[ashframe] shop sign colors refreshed.", .{});
+	}
+	return pending;
+}
+
+fn isHex6(s: []const u8) bool {
+	if (s.len < 6) return false;
+	for (s[0..6]) |c| {
+		if (!std.ascii.isHex(c)) return false;
+	}
+	return true;
+}
+
+/// Owner display name from existing sign text: the last line, minus `#rrggbb`
+/// color codes. Shop signs have always stored the (code-stripped) owner name
+/// there, so migration can re-render without the owner online. Null when
+/// there is no usable name (empty, or longer than `buf` — in which case the
+/// sign is left alone rather than truncated).
+fn lastTextLine(text: []const u8, buf: []u8) ?[]const u8 {
+	var len: usize = 0;
+	var i: usize = 0;
+	while (i < text.len) {
+		if (text[i] == '#' and isHex6(text[i + 1 ..])) {
+			i += 7;
+			continue;
+		}
+		if (len >= buf.len) return null;
+		buf[len] = text[i];
+		len += 1;
+		i += 1;
+	}
+	const stripped = buf[0..len];
+	const line = if (std.mem.lastIndexOfScalar(u8, stripped, '\n')) |nl| stripped[nl + 1 ..] else stripped;
+	const name = std.mem.trim(u8, line, " \r\t");
+	if (name.len == 0) return null;
+	return name;
+}
+
+/// Rewrites one shop sign with the sign-aware colors. True = done (or
+/// nothing to do); false = retry later.
+fn refreshOne(s: *Shop) bool {
+	const world = main.server.world orelse return false;
+	const signPos: Vec3i = .{s.sign[0], s.sign[1], s.sign[2]};
+	const block = world.getBlock(signPos[0], signPos[1], signPos[2]) orelse return false;
+	// Sign gone (broken/moved): onBroken prunes the entry; don't retry forever.
+	if (!isSignBlock(block)) return true;
+	const simChunk = world.getSimulationChunkAndIncreaseRefCount(signPos[0], signPos[1], signPos[2]) orelse return false;
+	defer simChunk.decreaseRefCount();
+	const ch = simChunk.chunk.load(.monotonic) orelse return false;
+	const current = signType.getText(signPos, &ch.super) orelse return false;
+	// Owner-customized text is left alone; only generated signs are recolored.
+	if (!std.mem.startsWith(u8, current, "#ffcc00[Shop]") and !std.mem.startsWith(u8, current, "#000000[Shop]")) return true;
+	var nameBuf: [64]u8 = undefined;
+	const ownerName = lastTextLine(current, &nameBuf) orelse return true;
+	const goods: BaseItemIndex = @enumFromInt(s.goodsItem);
+	const price: BaseItemIndex = @enumFromInt(s.priceItem);
+	var buf: [256]u8 = undefined;
+	const newText = formatSignText(s.mode, s.goodsAmount, shortId(goods), s.priceAmount, shortId(price), ownerName, signIsLight(block), &buf) catch return true;
+	if (std.mem.eql(u8, newText, current)) return true;
+	if (!writeSign(signPos, newText)) return false;
+	main.network.protocols.blockEntityUpdate.sendServerDataUpdateToClients(signPos);
+	return true;
+}
+
+test "shop sign schemes" {
+	var buf: [256]u8 = undefined;
+	const dark = try formatSignText(.sell, 2, "amber", 5, "ruby", "Bob", false, &buf);
+	try std.testing.expect(std.mem.startsWith(u8, dark, "#ffcc00[Shop] Sell#ffffff"));
+	try std.testing.expect(std.mem.indexOf(u8, dark, "\n-5x ruby\n+2x amber\nBob") != null);
+	var buf2: [256]u8 = undefined;
+	const light = try formatSignText(.buy, 2, "amber", 5, "ruby", "Bob", true, &buf2);
+	try std.testing.expect(std.mem.startsWith(u8, light, "#000000[Shop] Buy#000000"));
+	try std.testing.expect(std.mem.indexOf(u8, light, "\n+5x ruby\n-2x amber\nBob") != null);
+	try std.testing.expect(schemeForId("cubyz:sign/birch"));
+	try std.testing.expect(schemeForId("cubyz:sign/baobab"));
+	try std.testing.expect(schemeForId("cubyz:sign/palm"));
+	try std.testing.expect(!schemeForId("cubyz:sign/oak"));
+	try std.testing.expect(!schemeForId("cubyz:sign/mahogany"));
+	try std.testing.expect(!schemeForId("cubyz:sign/cirrus"));
+	try std.testing.expect(!schemeForId("ashframe:sign/custom"));
+	var nb: [64]u8 = undefined;
+	const owner = lastTextLine("#ffcc00[Shop] Sell#ffffff\n-5x ruby\n+2x amber\nBob", &nb);
+	try std.testing.expect(owner != null and std.mem.eql(u8, owner.?, "Bob"));
+	const empty = lastTextLine("#ffcc00[Shop] Sell#ffffff\n", &nb);
+	try std.testing.expect(empty == null);
+}
+
+test "shop sign attachment is side-mount only" {
+	const signPos: Vec3i = .{100, 200, 300}; // (x, horizontal, vertical)
+	// Side mounts resolve to the block the sign faces.
+	try std.testing.expectEqual(Vec3i{99, 200, 300}, signAttachmentPos(signPos, .{.typ = 0, .data = 16}).?);
+	try std.testing.expectEqual(Vec3i{100, 199, 300}, signAttachmentPos(signPos, .{.typ = 0, .data = 17}).?);
+	try std.testing.expectEqual(Vec3i{101, 200, 300}, signAttachmentPos(signPos, .{.typ = 0, .data = 18}).?);
+	try std.testing.expectEqual(Vec3i{100, 201, 300}, signAttachmentPos(signPos, .{.typ = 0, .data = 19}).?);
+	// Floor/ceiling mounts and garbage are rejected.
+	try std.testing.expect(signAttachmentPos(signPos, .{.typ = 0, .data = 0}) == null);
+	try std.testing.expect(signAttachmentPos(signPos, .{.typ = 0, .data = 8}) == null);
+	try std.testing.expect(signAttachmentPos(signPos, .{.typ = 0, .data = 20}) == null);
+	// signMountedOn: attached exactly on `attachedPos`, not a neighbour beyond it.
+	try std.testing.expect(signMountedOn(signPos, .{.typ = 0, .data = 16}, .{99, 200, 300}));
+	try std.testing.expect(!signMountedOn(signPos, .{.typ = 0, .data = 16}, .{100, 200, 300}));
+	try std.testing.expect(!signMountedOn(signPos, .{.typ = 0, .data = 16}, .{98, 200, 300}));
+}
+
+test "shop trade summary direction" {
+	// Sentence always reads "bought <received> for <paid>", independent of mode.
+	// Guards the bug where buy-shops reported goods/price inverted.
+	var buf: [256]u8 = undefined;
+	const got = try tradeSummaryParts("fabrovio", 40, "limestone", 2, "copper_ingot", &buf);
+	try std.testing.expectEqualStrings("fabrovio bought 40 limestone for 2 copper_ingot", got);
+}
+
 // --- ASHFRAME CUSTOM (Sign shops) ---

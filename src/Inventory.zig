@@ -303,6 +303,21 @@ pub const server = struct { // MARK: server
 				}
 				return error.Invalid;
 			},
+			// --- ASHFRAME CUSTOM (Sign shops: confirmation menu) ---
+			// The menu inventory is pre-created by shops.zig; opening it just
+			// attaches this user (so several customers can share one menu).
+			.shopMenu => {
+				inventoryCreationMutex.lock();
+				defer inventoryCreationMutex.unlock();
+				for (inventories.items()) |*inv| {
+					if (std.meta.eql(inv.source, source)) {
+						inv.addUser(user, clientId);
+						return;
+					}
+				}
+				return error.Invalid;
+			},
+			// --- ASHFRAME CUSTOM (Sign shops) ---
 			.workbench => {
 				const workbench_close_callback = struct {
 					fn callback(callbackSource: Source) void {
@@ -330,13 +345,13 @@ pub const server = struct { // MARK: server
 		inventoryCreationMutex.lock();
 		const inventory = ServerInventory.init(len, source, .internallyManaged, callbacks);
 		inventoryCreationMutex.unlock();
-
 		inventories.items()[@intFromEnum(inventory.inv.id)] = inventory;
 		inventories.items()[@intFromEnum(inventory.inv.id)].addUser(user, clientId);
 
 		switch (source) {
 			.blockInventory => unreachable, // Should be loaded by the block entity
 			.playerInventory, .hand => unreachable, // Should be loaded on player creation
+			.shopMenu => unreachable, // Pre-created by shops and attached via attachExisting
 			.other => {},
 			.workbench => {},
 			.alreadyFreed => unreachable,
@@ -437,6 +452,13 @@ pub const SourceType = enum(u8) {
 	hand = 3,
 	blockInventory = 5,
 	workbench = 6,
+	// --- ASHFRAME CUSTOM (Sign shops: confirmation menu) ---
+	// A server-created, shareable inventory shown to a customer instead of the
+	// real chest, holding only the green/red yes/no markers. Never sent by a
+	// vanilla client (only ever created/opened server-side); the position is
+	// the shop chest's, so one menu exists per shop.
+	shopMenu = 7,
+	// --- ASHFRAME CUSTOM (Sign shops) ---
 	other = 0xff, // TODO: List every type separately here.
 };
 pub const Source = union(SourceType) {
@@ -445,6 +467,9 @@ pub const Source = union(SourceType) {
 	hand: main.entity.Entity,
 	blockInventory: Vec3i,
 	workbench: struct { playerId: main.entity.Entity, proceduralItemIndex: ProceduralItemTypeIndex },
+	// --- ASHFRAME CUSTOM (Sign shops: confirmation menu) ---
+	shopMenu: Vec3i,
+	// --- ASHFRAME CUSTOM (Sign shops) ---
 	other: void,
 };
 

@@ -439,6 +439,15 @@ pub const BlockEntityTypes = struct { // MARK: BlockEntityTypes
 			updateServerData(pos, chunk, .{.update = &reader}) catch {};
 		}
 
+		/// Server-side read of a sign's current text (used by shops to refresh
+		/// sign colors). Null when the chunk isn't loaded or has no sign data.
+		pub fn getText(pos: Vec3i, chunk: *Chunk) ?[]const u8 {
+			StorageServer.mutex.lock();
+			defer StorageServer.mutex.unlock();
+			const data = StorageServer.get(pos, chunk) orelse return null;
+			return data.text;
+		}
+
 		pub const onStoreServerToClient = onStoreServerToDisk;
 		pub fn onStoreServerToDisk(entity: BlockEntity, writer: *BinaryWriter) void {
 			StorageServer.mutex.lock();

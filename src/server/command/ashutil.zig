@@ -5,6 +5,18 @@ const command = main.server.command;
 const Source = command.Source;
 const User = main.server.User;
 
+fn isHex(c: u8) bool {
+	return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
+
+fn isHex6(s: []const u8) bool {
+	if (s.len < 6) return false;
+	for (s[0..6]) |c| {
+		if (!isHex(c)) return false;
+	}
+	return true;
+}
+
 /// Strips Cubyz color codes (§#rrggbb) from a name so fuzzy matching works on the visible text.
 pub fn cleanColorCodes(allocator: std.mem.Allocator, name: []const u8) []const u8 {
 	var result: std.ArrayList(u8) = .empty;
@@ -12,11 +24,15 @@ pub fn cleanColorCodes(allocator: std.mem.Allocator, name: []const u8) []const u
 
 	var i: usize = 0;
 	while (i < name.len) {
+		// § is two bytes (C2 A7); skipping one left a stray 0xA7
+		// continuation byte behind (invalid UTF-8 downstream).
 		if (std.mem.startsWith(u8, name[i..], "§")) {
-			i += 1;
-			if (i < name.len and name[i] == '#') {
-				i += 7;
-			}
+			i += 2;
+			if (i < name.len and name[i] == '#') i += 7;
+			continue;
+		}
+		if (name[i] == '#' and i + 6 < name.len and isHex6(name[i + 1 ..])) {
+			i += 7;
 			continue;
 		}
 		result.append(allocator, name[i]) catch {};
@@ -85,6 +101,11 @@ fn isOrb(item: main.items.Item) bool {
 /// Removes `amount` orbs from the player's inventory.
 /// Returns false (and explains) when they don't have enough.
 pub fn chargeOrbs(user: *User, source: Source, amount: u16) bool {
+	// Bisect toggle: economy frozen while off.
+	if (!main.settings.launchConfig.serverAuthoritativeCharges) {
+		source.sendMessage("#e6312cPayments are temporarily disabled.", .{});
+		return false;
+	}
 	const inv = main.items.Inventory.server.getInventoryFromSource(.{.playerInventory = user.id}) orelse {
 		source.sendMessage("#e6312cCould not find your inventory.", .{});
 		return false;
@@ -126,6 +147,7 @@ pub fn chargeOrbs(user: *User, source: Source, amount: u16) bool {
 
 /// Gives `amount` orbs to the player.
 pub fn giveOrbs(user: *User, amount: u16) void {
+	if (!main.settings.launchConfig.serverAuthoritativeCharges) return;
 	const base = main.items.BaseItemIndex.fromId("ashframe:amber_orb") orelse return;
 	var stack = main.items.ItemStack{ .item = .{.baseItem = base}, .amount = amount };
 	main.items.Inventory.server.tryCollectingToPlayerInventory(user, &stack);
@@ -133,6 +155,7 @@ pub fn giveOrbs(user: *User, amount: u16) void {
 
 /// Gives back `amount` of a named item (undo a `chargeItem`).
 pub fn refundItem(user: *User, itemId: []const u8, amount: u16) void {
+	if (!main.settings.launchConfig.serverAuthoritativeCharges) return;
 	const base = main.items.BaseItemIndex.fromId(itemId) orelse return;
 	var stack = main.items.ItemStack{ .item = .{.baseItem = base}, .amount = amount };
 	main.items.Inventory.server.tryCollectingToPlayerInventory(user, &stack);
@@ -152,6 +175,11 @@ pub fn itemDisplayName(itemId: []const u8) []const u8 {
 
 /// Removes `amount` of a named item from the player's inventory.
 pub fn chargeItem(user: *User, source: Source, itemId: []const u8, display: []const u8, amount: u16) bool {
+	// Bisect toggle: economy frozen while off.
+	if (!main.settings.launchConfig.serverAuthoritativeCharges) {
+		source.sendMessage("#e6312cPayments are temporarily disabled.", .{});
+		return false;
+	}
 	const base = main.items.BaseItemIndex.fromId(itemId) orelse {
 		source.sendMessage("#e6312cItem {s} is unavailable.", .{display});
 		return false;

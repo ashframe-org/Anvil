@@ -29,6 +29,25 @@ var heldDiscarded: std.atomic.Value(u64) = .init(0);
 var anticheatNotes: std.atomic.Value(u64) = .init(0);
 var anticheatNotesThrottled: std.atomic.Value(u64) = .init(0);
 var anticheatSuspects: std.atomic.Value(u64) = .init(0);
+// --- ASHFRAME CUSTOM (NET-001: gen-vs-compress split) ---
+// Chunk terrain-generation vs chunk-compression time, in microseconds.
+// Noted from worker threads (generateChunk / sendChunkOverTheNetwork);
+// sampled on the server thread like the other counters.
+var chunkGenUsTotal: std.atomic.Value(u64) = .init(0);
+var chunkGenCount: std.atomic.Value(u64) = .init(0);
+var chunkCompressUsTotal: std.atomic.Value(u64) = .init(0);
+var chunkCompressCount: std.atomic.Value(u64) = .init(0);
+
+pub fn noteChunkGenUs(us: u64) void {
+	_ = chunkGenUsTotal.fetchAdd(us, .monotonic);
+	_ = chunkGenCount.fetchAdd(1, .monotonic);
+}
+
+pub fn noteChunkCompressUs(us: u64) void {
+	_ = chunkCompressUsTotal.fetchAdd(us, .monotonic);
+	_ = chunkCompressCount.fetchAdd(1, .monotonic);
+}
+// --- ASHFRAME CUSTOM (NET-001) ---
 
 // --- Server-load-driven render distance cap ---
 // A single global "how far may anyone stream right now" value, derived from real
@@ -38,7 +57,14 @@ pub var loadRenderDistance: std.atomic.Value(u16) = .init(0);
 /// Discrete cap levels. The server sits on one level and only steps after the
 /// load has proven it can (or can't) handle it, which stops the old continuous
 /// cap from oscillating against its own promotions.
-const loadRdLevels = [_]u16{4, 6, 8, 10, 12, 16, 20, 24};
+// --- ASHFRAME CUSTOM (UX-4: higher load-cap floor) ---
+// Was {4, 6, 8, 10, 12, 16, 20, 24}. The floor of 4 throttled chunk
+// delivery exactly during join/teleport bursts (loadRD pinned at 4 with
+// pending in the tens of thousands) while the pool had headroom. Floor is
+// now 8; thresholds/EMA untouched (conservative: measure before retuning
+// pressure itself).
+// --- ASHFRAME CUSTOM (UX-4) ---
+const loadRdLevels = [_]u16{8, 10, 12, 16, 20, 24};
 /// Outstanding work (queued + deferred) at which queue pressure reaches 1.
 const loadPendingTarget: f64 = 1024;
 /// Tick budget; overrun beyond this also counts as pressure.
@@ -132,6 +158,19 @@ var prevErrors: u64 = 0;
 var prevWarns: u64 = 0;
 var prevChunkgenTasks: u64 = 0;
 var prevChunkgenUtime: i64 = 0;
+// --- ASHFRAME CUSTOM (NET-001) ---
+var prevMeshgenTasks: u64 = 0;
+var prevMeshgenUtime: i64 = 0;
+var prevBlockBytes: u64 = 0;
+var prevEntityBytes: u64 = 0;
+var prevGenericBytes: u64 = 0;
+var prevPlayerPosBytes: u64 = 0;
+var prevInvBytes: u64 = 0;
+var prevChunkGenUs: u64 = 0;
+var prevChunkGenN: u64 = 0;
+var prevChunkCompressUs: u64 = 0;
+var prevChunkCompressN: u64 = 0;
+// --- ASHFRAME CUSTOM (NET-001) ---
 
 const Stats = struct {
 	tps: f64 = 0,
@@ -145,6 +184,25 @@ const Stats = struct {
 	workMsPeakSession: f32 = 0,
 	players: u32 = 0,
 	threadQueue: usize = 0,
+	// --- ASHFRAME CUSTOM (NET-001: pool + wire observability) ---
+	poolBusy: usize = 0,
+	poolSize: usize = 0,
+	meshgenAvgUs: f64 = 0,
+	blockBytesPerS: f64 = 0,
+	entityBytesPerS: f64 = 0,
+	genericBytesPerS: f64 = 0,
+	playerPosBytesPerS: f64 = 0,
+	invBytesPerS: f64 = 0,
+	otherBytesPerS: f64 = 0,
+	chunkGenAvgUs: f64 = 0,
+	chunkCompressAvgUs: f64 = 0,
+	chLossyQueued: usize = 0,
+	chLossyUnconfirmed: usize = 0,
+	chSecureQueued: usize = 0,
+	chSecureUnconfirmed: usize = 0,
+	chSlowQueued: usize = 0,
+	chSlowUnconfirmed: usize = 0,
+	// --- ASHFRAME CUSTOM (NET-001) ---
 	chunkgenTasks: u64 = 0,
 	chunkgenTasksPerS: f64 = 0,
 	chunkgenAvgUs: f64 = 0,
@@ -223,7 +281,12 @@ pub fn sampleTick(deltaSeconds: f32) void {
 
 	// File I/O only once a second (reuses the latest sample between writes).
 	if (doFile) writeSnapshot(stats, nowMs());
-	if (doLog) logSummary(stats);
+	if (doLog) {
+		logSummary(stats);
+		// --- ASHFRAME CUSTOM (NET-001) ---
+		logNetSummary(stats);
+		// --- ASHFRAME CUSTOM (NET-001) ---
+	}
 }
 
 fn computeStats(elapsed: f64) Stats {
@@ -276,6 +339,49 @@ fn computeStats(elapsed: f64) Stats {
 	prevChunkgenTasks = chunkgenTasks;
 	prevChunkgenUtime = chunkgenUtime;
 
+	// --- ASHFRAME CUSTOM (NET-001: pool + wire observability) ---
+	// All reads are lock-free atomics or an already-mutexed snapshot;
+	// no behavior change, sampling only.
+	var busy: usize = 0;
+	for (main.threadPool.currentTasks) |*t| {
+		if (t.load(.monotonic) != null) busy += 1;
+	}
+	stats.poolBusy = busy;
+	stats.poolSize = main.threadPool.threads.len;
+
+	const meshIndex = @intFromEnum(main.utils.ThreadPool.TaskType.meshgenAndLighting);
+	const meshTasks: u64 = perf.tasks[meshIndex];
+	const meshUtime: i64 = perf.utime[meshIndex];
+	const meshDelta = if (meshTasks >= prevMeshgenTasks) meshTasks - prevMeshgenTasks else meshTasks;
+	const meshUDelta = if (meshUtime >= prevMeshgenUtime) meshUtime - prevMeshgenUtime else meshUtime;
+	stats.meshgenAvgUs = if (meshDelta > 0) @as(f64, @floatFromInt(meshUDelta))/@as(f64, @floatFromInt(meshDelta)) else 0;
+	prevMeshgenTasks = meshTasks;
+	prevMeshgenUtime = meshUtime;
+
+	const genUs = chunkGenUsTotal.load(.monotonic);
+	const genN = chunkGenCount.load(.monotonic);
+	const genUsDelta = if (genUs >= prevChunkGenUs) genUs - prevChunkGenUs else genUs;
+	const genNDelta = if (genN >= prevChunkGenN) genN - prevChunkGenN else genN;
+	stats.chunkGenAvgUs = if (genNDelta > 0) @as(f64, @floatFromInt(genUsDelta))/@as(f64, @floatFromInt(genNDelta)) else 0;
+	prevChunkGenUs = genUs;
+	prevChunkGenN = genN;
+	const compUs = chunkCompressUsTotal.load(.monotonic);
+	const compN = chunkCompressCount.load(.monotonic);
+	const compUsDelta = if (compUs >= prevChunkCompressUs) compUs - prevChunkCompressUs else compUs;
+	const compNDelta = if (compN >= prevChunkCompressN) compN - prevChunkCompressN else compN;
+	stats.chunkCompressAvgUs = if (compNDelta > 0) @as(f64, @floatFromInt(compUsDelta))/@as(f64, @floatFromInt(compNDelta)) else 0;
+	prevChunkCompressUs = compUs;
+	prevChunkCompressN = compN;
+
+	const cht = main.server.connectionManager.channelTotals();
+	stats.chLossyQueued = cht.lossyQueued;
+	stats.chLossyUnconfirmed = cht.lossyUnconfirmed;
+	stats.chSecureQueued = cht.secureQueued;
+	stats.chSecureUnconfirmed = cht.secureUnconfirmed;
+	stats.chSlowQueued = cht.slowQueued;
+	stats.chSlowUnconfirmed = cht.slowUnconfirmed;
+	// --- ASHFRAME CUSTOM (NET-001) ---
+
 	const reqCount = chunkRequestsReceived.load(.monotonic);
 	const sentCount = chunksSent.load(.monotonic);
 	const reqDelta = if (reqCount >= prevChunkRequests) reqCount - prevChunkRequests else reqCount;
@@ -322,6 +428,34 @@ fn computeStats(elapsed: f64) Stats {
 	prevChunkBytes = chunkBytes;
 	prevTotalBytes = totalBytes;
 	prevRecvBytes = recvBytes;
+
+	// --- ASHFRAME CUSTOM (NET-001: per-protocol bytes/s) ---
+	// Placed after chunkDelta/totalDelta exist. `other` = total minus all
+	// tracked protocols (handshake, chat, lightmaps, block-entity, ...).
+	const P = main.network.protocols;
+	const blk = P.bytesSent[P.blockUpdate.id].load(.monotonic);
+	const ent = P.bytesSent[P.entity.id].load(.monotonic) + P.bytesSent[P.entityPosition.id].load(.monotonic);
+	const genP = P.bytesSent[P.genericUpdate.id].load(.monotonic);
+	const posB = P.bytesSent[P.playerPosition.id].load(.monotonic);
+	const invB = P.bytesSent[P.inventory.id].load(.monotonic);
+	const blkDelta = if (blk >= prevBlockBytes) blk - prevBlockBytes else blk;
+	const entDelta = if (ent >= prevEntityBytes) ent - prevEntityBytes else ent;
+	const genPDelta = if (genP >= prevGenericBytes) genP - prevGenericBytes else genP;
+	const posBDelta = if (posB >= prevPlayerPosBytes) posB - prevPlayerPosBytes else posB;
+	const invBDelta = if (invB >= prevInvBytes) invB - prevInvBytes else invB;
+	stats.blockBytesPerS = @as(f64, @floatFromInt(blkDelta))/elapsed;
+	stats.entityBytesPerS = @as(f64, @floatFromInt(entDelta))/elapsed;
+	stats.genericBytesPerS = @as(f64, @floatFromInt(genPDelta))/elapsed;
+	stats.playerPosBytesPerS = @as(f64, @floatFromInt(posBDelta))/elapsed;
+	stats.invBytesPerS = @as(f64, @floatFromInt(invBDelta))/elapsed;
+	const knownDelta = blkDelta + entDelta + genPDelta + posBDelta + invBDelta + chunkDelta;
+	stats.otherBytesPerS = if (totalDelta >= knownDelta) @as(f64, @floatFromInt(totalDelta - knownDelta))/elapsed else 0;
+	prevBlockBytes = blk;
+	prevEntityBytes = ent;
+	prevGenericBytes = genP;
+	prevPlayerPosBytes = posB;
+	prevInvBytes = invB;
+	// --- ASHFRAME CUSTOM (NET-001) ---
 
 	const logCounts = main.server.report.logCounts();
 	stats.errors = logCounts.errors;
@@ -442,6 +576,42 @@ fn writeSnapshot(stats: Stats, now: i64) void {
 	buf.print("{d}", .{stats.errors});
 	buf.appendSlice(",\"warnings\":");
 	buf.print("{d}", .{stats.warnings});
+	// --- ASHFRAME CUSTOM (NET-001: pool + wire observability) ---
+	buf.appendSlice(",\"pool_busy\":");
+	buf.print("{d}", .{stats.poolBusy});
+	buf.appendSlice(",\"pool_size\":");
+	buf.print("{d}", .{stats.poolSize});
+	buf.appendSlice(",\"meshgen_avg_us\":");
+	buf.print("{d:.1}", .{stats.meshgenAvgUs});
+	buf.appendSlice(",\"block_bytes_per_s\":");
+	buf.print("{d:.0}", .{stats.blockBytesPerS});
+	buf.appendSlice(",\"entity_bytes_per_s\":");
+	buf.print("{d:.0}", .{stats.entityBytesPerS});
+	buf.appendSlice(",\"generic_bytes_per_s\":");
+	buf.print("{d:.0}", .{stats.genericBytesPerS});
+	buf.appendSlice(",\"playerpos_bytes_per_s\":");
+	buf.print("{d:.0}", .{stats.playerPosBytesPerS});
+	buf.appendSlice(",\"inv_bytes_per_s\":");
+	buf.print("{d:.0}", .{stats.invBytesPerS});
+	buf.appendSlice(",\"other_bytes_per_s\":");
+	buf.print("{d:.0}", .{stats.otherBytesPerS});
+	buf.appendSlice(",\"chunk_gen_avg_us\":");
+	buf.print("{d:.1}", .{stats.chunkGenAvgUs});
+	buf.appendSlice(",\"chunk_compress_avg_us\":");
+	buf.print("{d:.1}", .{stats.chunkCompressAvgUs});
+	buf.appendSlice(",\"ch_lossy_queued\":");
+	buf.print("{d}", .{stats.chLossyQueued});
+	buf.appendSlice(",\"ch_lossy_unconfirmed\":");
+	buf.print("{d}", .{stats.chLossyUnconfirmed});
+	buf.appendSlice(",\"ch_secure_queued\":");
+	buf.print("{d}", .{stats.chSecureQueued});
+	buf.appendSlice(",\"ch_secure_unconfirmed\":");
+	buf.print("{d}", .{stats.chSecureUnconfirmed});
+	buf.appendSlice(",\"ch_slow_queued\":");
+	buf.print("{d}", .{stats.chSlowQueued});
+	buf.appendSlice(",\"ch_slow_unconfirmed\":");
+	buf.print("{d}", .{stats.chSlowUnconfirmed});
+	// --- ASHFRAME CUSTOM (NET-001) ---
 	buf.appendSlice("}\n");
 
 	const path = main.stackAllocator.print("saves/{s}/ashframe_metrics.json", .{world.path});
@@ -450,6 +620,34 @@ fn writeSnapshot(stats: Stats, now: i64) void {
 		std.log.err("Could not write Ashframe metrics: {s}", .{@errorName(err)});
 	};
 }
+
+// --- ASHFRAME CUSTOM (NET-001: [perfnet] line) ---
+// Separate line so the existing [perf] format (parsed by muscle memory and
+// tooling) never changes. Same 10 s cadence as logSummary.
+fn logNetSummary(stats: Stats) void {
+	std.log.info("[perfnet] pool {d}/{d} q {d} | gen {d:.1}us/chunk compress {d:.1}us/chunk mesh {d:.1}us | B/s ch {d:.0} blk {d:.0} ent {d:.0} gen {d:.0} pos {d:.0} inv {d:.0} other {d:.0} | chan Q/U lossy {d}/{d} secure {d}/{d} slow {d}/{d}", .{
+		stats.poolBusy,
+		stats.poolSize,
+		stats.threadQueue,
+		stats.chunkGenAvgUs,
+		stats.chunkCompressAvgUs,
+		stats.meshgenAvgUs,
+		stats.chunkBytesPerS,
+		stats.blockBytesPerS,
+		stats.entityBytesPerS,
+		stats.genericBytesPerS,
+		stats.playerPosBytesPerS,
+		stats.invBytesPerS,
+		stats.otherBytesPerS,
+		stats.chLossyQueued,
+		stats.chLossyUnconfirmed,
+		stats.chSecureQueued,
+		stats.chSecureUnconfirmed,
+		stats.chSlowQueued,
+		stats.chSlowUnconfirmed,
+	});
+}
+// --- ASHFRAME CUSTOM (NET-001) ---
 
 fn logSummary(stats: Stats) void {
 		std.log.info("[perf] tps {d:.1} | period {d:.1}/{d:.1}/{d:.1} work {d:.1}/{d:.1}/{d:.1} ms | queue {d} loadRD {d} pending {d} | chunkgen {d:.0}/s {d:.0}us dropped {d:.0}/s | chunks {d:.0}/s {d:.0} KB/s | net {d:.0} KB/s in {d:.0} KB/s | deferred {d} heldDiscarded {d} (capped {d}) | pos {d:.0}/s speed {d:.0} | notes {d:.0}/s muted {d:.0}/s susp {d:.1}/s | players {d} | err {d} warn {d} | peakWork {d:.1} ms", .{

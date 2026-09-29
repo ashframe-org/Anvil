@@ -223,6 +223,11 @@ pub const User = struct { // MARK: User
 	newKeyString: ?[]const u8 = null,
 	key: network.authentication.PublicKey = undefined,
 	legacyKey: ?network.authentication.PublicKey = null,
+	// --- ASHFRAME CUSTOM (UX-6: asset pack skip) ---
+	/// Pack hash announced by custom clients that already cache our assets.
+	/// Null = vanilla/uncached: always send the full pack.
+	ashframePackHash: ?u64 = null,
+	// --- ASHFRAME CUSTOM (UX-6) ---
 
 	inventoryClientToServerIdMap: std.AutoHashMap(InventoryId, InventoryId) = undefined,
 	inventory: ?InventoryId = null,
@@ -244,11 +249,26 @@ pub const User = struct { // MARK: User
 	anticheatLastPos: ?[3]f64 = null,
 	anticheatLastTime: i64 = 0,
 	teleportGraceUntil: i64 = 0,
+	// --- ASHFRAME CUSTOM (Anticheat: flight pattern) ---
+	// Consecutive position updates looking like sustained flight (fast
+	// horizontal, not falling) for a server-side survival player. Log-only.
+	flyStreak: u16 = 0,
+	// --- ASHFRAME CUSTOM (Anticheat) ---
 	// Cached on the server thread (permissions can't be read off-thread).
 	anticheatStaff: bool = false,
 	rateChat: anticheat.TokenBucket = .{.capacity = 12, .refillPerSec = 6},
 	rateCommand: anticheat.TokenBucket = .{.capacity = 20, .refillPerSec = 10},
-	rateInventory: anticheat.TokenBucket = .{.capacity = 120, .refillPerSec = 60},
+	/// Retired: inventory/crafting traffic bypasses rate limiting entirely
+	/// (dropping it left the client's optimistic change hanging with no
+	/// reply). Kept so the shape of the struct — and any future re-use —
+	/// stays obvious.
+	rateInventory: anticheat.TokenBucket = .{.capacity = 600, .refillPerSec = 240},
+	/// Block place/break shares the inventory protocol but gets its own
+	/// generous bucket so fast builders are never flagged as inventory floods.
+	rateBlock: anticheat.TokenBucket = .{.capacity = 900, .refillPerSec = 450},
+	/// Retired: damage reports bypass rate limiting entirely (see
+	/// protocols.zig). Kept for introspection only.
+	rateDamage: anticheat.TokenBucket = .{.capacity = 600, .refillPerSec = 240},
 	/// Per-category mute timestamps for high-frequency anticheat logging, so a
 	/// fast player can't generate 20 notes/second (each a log + allocations +
 	/// O(n) report bookkeeping) and stall the tick.
@@ -655,6 +675,22 @@ pub const User = struct { // MARK: User
 		// --- ASHFRAME CUSTOM (default command permissions) ---
 		main.entity.components.@"cubyz:permissions".server.addToGroup(self.id, permission.Group.default);
 
+		// --- ASHFRAME CUSTOM (Server owner bootstrap) ---
+		// The account key in launchConfig `serverOwnerKey` gets full
+		// permissions ("/", i.e. console-equivalent) on every join. This is
+		// the only way to bootstrap an admin on a dedicated server: group
+		// membership otherwise needs an existing admin to grant it.
+		// addPermission is a map put (idempotent). Key-based, so name/color
+		// changes don't break it.
+		if (main.settings.launchConfig.serverOwnerKey.len != 0) {
+			if (self.newKeyString) |key| {
+				if (std.mem.eql(u8, key, main.settings.launchConfig.serverOwnerKey)) {
+					main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/");
+				}
+			}
+		}
+		// --- ASHFRAME CUSTOM (Server owner bootstrap) ---
+
 		if (self.isLocal) {
 			main.entity.components.@"cubyz:permissions".server.addToGroup(self.id, permission.Group.moderator);
 			if (world.?.settings.allowCheats) {
@@ -824,7 +860,14 @@ pub const User = struct { // MARK: User
 	}
 
 	fn isNetworkQueueFull(self: *User) bool {
-		return self.conn.secureChannel.super.sendBuffer.buffer.len > 900000;
+		// --- ASHFRAME CUSTOM (UX-1b: backpressure follows the chunks) ---
+		// Chunks ride `.slow` since UX-1, so checking only `.secure` let the
+		// slow backlog grow unbounded (kept sending long after a render-
+		// distance cut). Pause dispatch while either channel is too full;
+		// tasks wait in the queue (never dropped — the client won't retry).
+		if (self.conn.secureChannel.super.sendBuffer.buffer.len > 900000) return true;
+		return self.conn.slowChannel.sendBuffer.buffer.len > 900000;
+		// --- ASHFRAME CUSTOM (UX-1b) ---
 	}
 
 	fn scheduleJobQueue(self: *User) void {
@@ -1299,6 +1342,11 @@ pub fn connectInternal(user: *User) void {
 	// Operators also get chat feedback when their dynamic render distance changes.
 	user.perfDebug = user.anticheatStaff;
 	main.network.protocols.handShake.sendServerPlayerData(user.conn);
+	// --- ASHFRAME CUSTOM (join-time sync): push the clock immediately so
+	// joining clients don't render noon until the 2 s tick. Stock `.time`
+	// packet — vanilla clients parse it identically. ---
+	main.network.protocols.genericUpdate.sendTime(user.conn, world.?);
+	// --- ASHFRAME CUSTOM (join-time sync) ---
 	user.conn.handShakeState.store(.complete, .monotonic);
 
 	// TODO: addEntity(player);
@@ -1319,8 +1367,7 @@ pub fn connectInternal(user: *User) void {
 		defer zonArray.deinit(main.stackAllocator);
 
 		const entityZon = user.player().save(main.stackAllocator, .playerNearby);
-		var nameBuf: [256]u8 = undefined;
-		if (titles.decoratedNameBuf(&nameBuf, user)) |decorated| entityZon.put("name", decorated);
+		putEntityName(entityZon, user);
 		zonArray.array.append(entityZon);
 		const data = zonArray.toStringEfficient(main.stackAllocator, &.{});
 		defer main.stackAllocator.free(data);
@@ -1333,8 +1380,7 @@ pub fn connectInternal(user: *User) void {
 		defer zonArray.deinit(main.stackAllocator);
 		for (userList) |other| {
 			const entityZon = other.player().save(main.stackAllocator, .playerNearby);
-			var nameBuf: [256]u8 = undefined;
-			if (titles.decoratedNameBuf(&nameBuf, other)) |decorated| entityZon.put("name", decorated);
+			putEntityName(entityZon, other);
 			zonArray.array.append(entityZon);
 		}
 		const data = zonArray.toStringEfficient(main.stackAllocator, &.{});
@@ -1368,6 +1414,21 @@ pub fn connectInternal(user: *User) void {
 	// --- ASHFRAME CUSTOM (Titles: distinct-days tracking) ---
 }
 
+/// Diagnostic (upstream request): validates every entity display name sent to
+/// clients and logs the raw bytes on failure. All inputs (handshake-validated
+/// player names, fixed ASCII titles) are expected valid, so a hit here would
+/// prove bad bytes originate server-side; silence proves they don't.
+fn putEntityName(entityZon: main.ZonElement, user: *User) void {
+	// Bisect toggle: plain validated usernames when decorated nametags are off.
+	if (!main.settings.launchConfig.titlesInNametag) return;
+	var nameBuf: [256]u8 = undefined;
+	const decorated = titles.decoratedNameBuf(&nameBuf, user) orelse return;
+	if (!std.unicode.utf8ValidateSlice(decorated)) {
+		std.log.err("[ashframe] invalid UTF-8 in entity name for {s}: {any}", .{ user.name, decorated });
+	}
+	entityZon.put("name", decorated);
+}
+
 /// Re-sends this player's entity to everyone else so a changed title is reflected
 /// in the above-head nametag. The decorated name is used only on the network copy,
 /// never on disk or in chat, so the player's real name stays intact.
@@ -1379,8 +1440,7 @@ pub fn refreshPlayerNametag(user: *User) void {
 	defer zonArray.deinit(main.stackAllocator);
 	zonArray.array.append(.{.int = @intFromEnum(user.id)}); // remove the stale entity
 	const entityZon = user.player().save(main.stackAllocator, .playerNearby);
-	var nameBuf: [256]u8 = undefined;
-	if (titles.decoratedNameBuf(&nameBuf, user)) |decorated| entityZon.put("name", decorated);
+	putEntityName(entityZon, user);
 	zonArray.array.append(entityZon); // re-add it with the updated nametag
 
 	const data = zonArray.toStringEfficient(main.stackAllocator, &.{});
@@ -1411,8 +1471,8 @@ pub fn messageFrom(msg: []const u8, source: *User) void { // MARK: message
 	defer tag.deinit();
 	titles.appendChatTag(&tag, source);
 	// The prefix/title tags above can carry their own §#rrggbb color code, so the
-	// name is explicitly reset to the standard light grey after them.
-	sendMessage("{s}§#cfcfcf{s}§#8a8a8a > §#cfcfcf{s}", .{tag.items, source.name, clean_msg});
+	// name is explicitly reset to plain white after them (readability).
+	sendMessage("{s}§#ffffff{s}§#8a8a8a > §#ffffff{s}", .{tag.items, source.name, clean_msg});
 	// --- ASHFRAME CUSTOM (Title tracking) ---
 }
 

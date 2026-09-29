@@ -213,6 +213,11 @@ pub const launchConfig = struct {
 	pub var cubyzDir: []const u8 = "";
 	pub var autoEnterWorld: []const u8 = "";
 	pub var headlessServer: bool = false;
+	/// Account public key of the server owner (e.g. "ed25519:..."). Matching
+	/// accounts get full permissions ("/") on every join — the only way to
+	/// bootstrap an admin on a dedicated server, where group membership
+	/// otherwise needs an existing admin. Empty = disabled.
+	pub var serverOwnerKey: []const u8 = "";
 	pub var preferredAuthenticationAlgorithm: main.network.authentication.KeyTypeEnum = .ed25519;
 	/// Writes `saves/<world>/ashframe_metrics.json` a few times a second for the
 	/// external monitor (`tools/ashframe_monitor.py`).
@@ -222,7 +227,30 @@ pub const launchConfig = struct {
 	pub var dynamicRenderDistance: bool = false;
 	/// Hides ores that have no exposed face in the chunk data sent to clients, so
 	/// x-ray mods can't see them. Revealed as they become exposed by mining.
-	pub var antiXray: bool = true;
+	/// OFF by default: the hide/reveal round-trip caused visible ore
+	/// appear/disappear flicker on chunk re-send, and there is little cheating
+	/// to defend against.
+	pub var antiXray: bool = false;
+	// --- ASHFRAME CUSTOM (Bisect toggles) ---
+	// Kill-switches for crash bisection. All default true (= current
+	// behaviour). Flip one to false, rebuild, restart, and retest the crash
+	// scenario; the first stable toggle names the system.
+	/// Decorated `[Title]\nName` nametags. Off = plain validated usernames.
+	pub var titlesInNametag: bool = true;
+	/// Custom particle sends (claim outlines, teleport poofs).
+	pub var customParticles: bool = true;
+	/// Non-`cubyz:` structures in worldgen (addon SBBs). New chunks only.
+	pub var customStructures: bool = true;
+	/// Server-authoritative inventory payments (charges/refunds/shop payouts).
+	/// Off = refused with a message, economy frozen.
+	pub var serverAuthoritativeCharges: bool = true;
+	// --- ASHFRAME CUSTOM (UX-6: asset pack skip) ---
+	/// Skip re-sending the asset pack when the joining client announces a
+	/// matching cached pack hash. Kill-switch: false restores always-send.
+	/// Vanilla clients never announce, so they always get the full pack.
+	pub var ashframePackSkip: bool = true;
+	// --- ASHFRAME CUSTOM (UX-6) ---
+	// --- ASHFRAME CUSTOM (Bisect toggles) ---
 
 	pub var vulkanTestingMode: bool = false;
 
@@ -235,12 +263,26 @@ pub const launchConfig = struct {
 
 		cubyzDir = main.globalArena.dupe(u8, zon.get([]const u8, "cubyzDir") orelse cubyzDir);
 		headlessServer = zon.get(bool, "headlessServer") orelse headlessServer;
+		serverOwnerKey = main.globalArena.dupe(u8, zon.get([]const u8, "serverOwnerKey") orelse serverOwnerKey);
 		autoEnterWorld = main.globalArena.dupe(u8, zon.get([]const u8, "autoEnterWorld") orelse autoEnterWorld);
 		preferredAuthenticationAlgorithm = zon.get(main.network.authentication.KeyTypeEnum, "preferredAuthenticationAlgorithm") orelse preferredAuthenticationAlgorithm;
 		vulkanTestingMode = zon.get(bool, "vulkanTestingMode") orelse false;
 		ashframeMetrics = zon.get(bool, "ashframeMetrics") orelse ashframeMetrics;
 		dynamicRenderDistance = zon.get(bool, "dynamicRenderDistance") orelse dynamicRenderDistance;
 		antiXray = zon.get(bool, "antiXray") orelse antiXray;
+		titlesInNametag = zon.get(bool, "titlesInNametag") orelse titlesInNametag;
+		customParticles = zon.get(bool, "customParticles") orelse customParticles;
+		customStructures = zon.get(bool, "customStructures") orelse customStructures;
+		serverAuthoritativeCharges = zon.get(bool, "serverAuthoritativeCharges") orelse serverAuthoritativeCharges;
+		// --- ASHFRAME CUSTOM (UX-6: asset pack skip) ---
+		ashframePackSkip = zon.get(bool, "ashframePackSkip") orelse ashframePackSkip;
+		// --- ASHFRAME CUSTOM (UX-6) ---
+		// --- ASHFRAME CUSTOM (UX-3: tunable worker count) ---
+		// `cpuThreads` existed but was never loaded, so the pool was always
+		// `nproc-1`. Expose it so the server can oversubscribe for blocking
+		// (disk/mutex) waits during chunk bursts. Null = auto.
+		cpuThreads = zon.get(u64, "cpuThreads") orelse cpuThreads;
+		// --- ASHFRAME CUSTOM (UX-3) ---
 	}
 };
 
