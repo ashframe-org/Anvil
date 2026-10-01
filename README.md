@@ -1,4 +1,4 @@
-# Cubyz-Ashframe-Server
+# Anvil - Custom Server Enviroment for Cubyz
 
 Custom server modification specifically for hosting and running the **Ashframe** community server.
 
