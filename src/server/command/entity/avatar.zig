@@ -12,9 +12,12 @@ pub const usage =
 	\\/avatar list
 ;
 pub const Args = union(enum) {
-	@"/avatar": struct {},
-	@"/avatar <entityModel>": struct { entityModel: command.EntityModel },
+	// NOTE: most specific first. parseUnion returns the first variant that
+	// parses, and the zero-field bare variant consumes nothing — declared
+	// first it shadows everything ("too many arguments, expected 0").
 	@"/avatar list": struct { action: enum { list } },
+	@"/avatar <entityModel>": struct { entityModel: command.EntityModel },
+	@"/avatar": struct {},
 };
 
 pub fn execute(args: Args, source: Source) void {
@@ -66,8 +69,11 @@ test "avatar command arg parsing" {
 	const cases = [_]struct { input: []const u8, expected: std.meta.Tag(Args) }{
 		.{ .input = "", .expected = .@"/avatar" },
 		.{ .input = "list", .expected = .@"/avatar list" },
-		// NOTE: no `<entityModel>` case: that variant needs the live model
-		// registry (getById), which unit tests don't populate.
+		// NOTE: no `<entityModel>` success case: that variant needs the
+		// live model registry (getById), which unit tests don't populate.
+		// Regression guard for the shadowing bug below asserts the bare
+		// variant does NOT claim a one-token input (it consumes nothing,
+		// so if tried first every input misroutes to it).
 	};
 	for (cases) |c| {
 		var errors: main.ListManaged(u8) = .init(main.stackAllocator);
@@ -78,4 +84,10 @@ test "avatar command arg parsing" {
 		};
 		try std.testing.expectEqual(c.expected, std.meta.activeTag(parsed));
 	}
+	// parseUnion tries variants in declaration order and the zero-field bare
+	// variant consumes nothing: it must stay LAST or it shadows everything
+	// ("too many arguments, expected 0" for any input).
+	const fields = @typeInfo(Args).@"union".fields;
+	try std.testing.expectEqualStrings("/avatar list", fields[0].name);
+	try std.testing.expectEqualStrings("/avatar", fields[fields.len - 1].name);
 }
