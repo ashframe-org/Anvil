@@ -39,7 +39,7 @@ Chat supports `:emoji:` shortcodes and `@player` mention pings.
 
 ## Added Content
 
-Blocks: `waypoint` (link pairs by placing 2), `sky_core` (place to reach the sky islands, min 128 apart, 3s cooldown — first use builds a pad with an unbreakable `return_core` back), `broken_sky_core` (ancient shrine loot), `large_sign`. Items: Amber Orb (teleport currency), core fragment. Particles: claim blocked/friend poofs. Structure: ancient sky shrine.
+Blocks: `waypoint` (link pairs by placing 2), `sky_core` (place to reach the sky islands, min 128 apart, 3s cooldown — first use builds a pad with an unbreakable `return_core` back), `broken_sky_core` (ancient shrine loot). Items: Amber Orb (teleport currency), core fragment. Particles: claim blocked/friend poofs. Structure: ancient sky shrine.
 
 ## Recipes
 

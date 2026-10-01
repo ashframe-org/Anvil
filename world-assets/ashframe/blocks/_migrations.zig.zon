@@ -1,0 +1,3 @@
+.{
+	.{.old = "large_sign", .new = "cubyz:air"},
+}
