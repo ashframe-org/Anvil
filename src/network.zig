@@ -1304,6 +1304,168 @@ pub const Connection = struct { // MARK: Connection
 		}
 	};
 
+	// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port) ---
+	// Reference: RFC 8899. ProbingState mirrors the §5.2 state machine
+	// (minus the Error state). Only the SERVER probes, and only Argon peers
+	// with ashframeClientVersion >= mtuProbeVersion: client-side connections
+	// (conn.user == null) never probe, and vanilla/old peers never see
+	// channel 7. Normal slow traffic (chunks, lightmaps) is untouched — a
+	// probe goes out only when the slow channel has nothing else to send.
+	/// Reference: RFC8899
+	/// Declarations can be found in 5.1
+	/// fields in the 5.2 state machine
+	const ProbingState = union(enum) {
+		/// the time to wait until a probe is unconfirmed (RFC recommnds at least 15 seconds)
+		const probeTimer: i64 = 15*1000*ms;
+		/// max probes are done until the probing is seen as failed (RFC default: 3)
+		const maxProbes: u8 = 3;
+
+		var nextIndex: SequenceIndex = 0;
+
+		/// In this state we are actively searching with probes for a higher mtu
+		searching: struct {
+			probedSize: u16 = undefined,
+			probeSequenceIndex: ?SequenceIndex = null,
+			probeTimeStamp: i64 = undefined,
+			probeCount: u8 = 0,
+		},
+		/// in this state we had a succesfull search and now use until the pmtuRaiseTimer is over the current mtu estimate
+		searchFinished: struct {
+			/// how long we wait after a finished search to search for an higher mtu again. (RFC default: 10 minutes)
+			pmtuRaiseTimer: i64 = 10*60*1000*ms,
+			/// the time we entered this state
+			timestamp: i64,
+		},
+
+		fn nextPacketIsProbe(self: *ProbingState, conn: *Connection, time: i64) bool {
+			// while the handshake is not complete, other messages are ignored, so probing would just fail
+			if (conn.handShakeState.load(.acquire) != .complete) return false;
+			// --- ASHFRAME CUSTOM (MTU gating): kill-switch, then capable
+			// peers only. Client-side never probes (conn.user == null); the
+			// server probes us if capable. ---
+			if (!main.settings.launchConfig.mtuProbing) return false;
+			const u = conn.user orelse return false;
+			if (!u.isArgon() or (u.ashframeClientVersion orelse 0) < main.server.User.mtuProbeVersion) return false;
+			switch (self.*) {
+				.searching => |*state| {
+					if (conn.mtuEstimate >= Connection.maxMtu - 50) {
+						self.* = .{.searchFinished = .{
+							.timestamp = time,
+						}};
+						return false;
+					}
+					if (state.probeSequenceIndex == null) return true;
+					if (time - state.probeTimeStamp > probeTimer) {
+						state.probeSequenceIndex = null;
+						state.probeCount += 1;
+
+						if (state.probeCount >= maxProbes) {
+							self.* = .{.searchFinished = .{
+								.timestamp = time,
+							}};
+						}
+					}
+					return false;
+				},
+				.searchFinished => |state| {
+					if (time - state.timestamp <= state.pmtuRaiseTimer) {
+						return false;
+					}
+					if (conn.mtuEstimate >= Connection.maxMtu - 50) return false;
+					self.* = .{.searching = .{}};
+					return true;
+				},
+			}
+		}
+
+		fn nextProbeSize(self: *ProbingState, conn: *Connection) u16 {
+			std.debug.assert(self.* == .searching);
+			self.searching.probedSize = @min(conn.mtuEstimate, Connection.maxMtu - 50) + 50;
+			return self.searching.probedSize;
+		}
+
+		fn receiveConfirmationAndGetTimestamp(self: *ProbingState, conn: *Connection, sequenceIndex: SequenceIndex) ?SendBuffer.ReceiveConfirmationResult {
+			if (self.* != .searching) return null;
+			if (self.searching.probeSequenceIndex != sequenceIndex) return null;
+
+			self.searching.probeCount = 0;
+			self.searching.probeSequenceIndex = null;
+			conn.mtuEstimate = self.searching.probedSize;
+			std.log.info("[mtu] estimate raised to {d}B", .{conn.mtuEstimate});
+			return .{
+				.timestamp = networkTimestamp(),
+				.packetLen = sequenceIndex,
+				.considerForCongestionControl = false,
+			};
+		}
+
+		fn setProbeInfo(self: *ProbingState, time: i64) SequenceIndex {
+			std.debug.assert(self.* == .searching);
+			self.searching.probeSequenceIndex = nextIndex;
+			nextIndex += 1;
+			self.searching.probeTimeStamp = time;
+			return self.searching.probeSequenceIndex.?;
+		}
+	};
+
+	const ProbeChannel = struct { // MARK: ProbeChannel
+		super: Channel,
+
+		pub fn init(sequenceIndex: SequenceIndex, delay: i64, id: ChannelId) ProbeChannel {
+			return .{
+				.super = .init(sequenceIndex, delay, id),
+			};
+		}
+
+		pub fn deinit(self: *ProbeChannel) void {
+			self.super.deinit();
+		}
+
+		pub fn connect(self: *ProbeChannel, remoteStart: SequenceIndex) void {
+			self.super.connect(remoteStart);
+		}
+
+		pub fn receive(self: *ProbeChannel, conn: *Connection, start: SequenceIndex, data: []const u8) !ReceiveBuffer.ReceiveStatus {
+			return self.super.receive(conn, start, data);
+		}
+
+		pub fn send(self: *ProbeChannel, protocolIndex: u8, data: []const u8, time: i64) !void {
+			return self.super.send(protocolIndex, data, time);
+		}
+
+		pub fn receiveConfirmationAndGetTimestamp(self: *ProbeChannel, start: SequenceIndex) ?SendBuffer.ReceiveConfirmationResult {
+			return self.super.receiveConfirmationAndGetTimestamp(start);
+		}
+
+		pub fn checkForLosses(self: *ProbeChannel, conn: *Connection, time: i64) LossStatus {
+			return self.super.checkForLosses(conn, time);
+		}
+
+		pub fn sendNextPacketAndGetSize(self: *ProbeChannel, conn: *Connection, time: i64, considerForCongestionControl: bool) ?usize {
+			if (!conn.mtuProbingState.nextPacketIsProbe(conn, time)) return self.super.sendNextPacketAndGetSize(conn, time, considerForCongestionControl);
+
+			if (self.super.sendNextPacketAndGetSize(conn, time, considerForCongestionControl)) |result| {
+				return result;
+			}
+
+			var writer = utils.BinaryWriter.initCapacity(main.stackAllocator, conn.mtuProbingState.nextProbeSize(conn));
+			defer writer.deinit();
+
+			const sequenceIndex = conn.mtuProbingState.setProbeInfo(time);
+			writer.writeEnum(ChannelId, ChannelId.probe);
+			writer.writeInt(SequenceIndex, sequenceIndex);
+			writer.data.items.len = writer.data.capacity;
+
+			_ = packetsSent.fetchAdd(1, .monotonic);
+			conn.manager.send(writer.data.items, conn.remoteAddress, null);
+			return writer.data.items.len;
+		}
+
+		pub fn getStatistics(self: *ProbeChannel, unconfirmed: *usize, queued: *usize) void {
+			return self.super.getStatistics(unconfirmed, queued);
+		}
+	};
+
 	const SecureChannel = struct { // MARK: SecureChannel
 		super: Channel,
 		sslContext: c.mbedtls_ssl_context = .{},
@@ -1506,6 +1668,11 @@ pub const Connection = struct { // MARK: Connection
 		init = 4,
 		keepalive = 5,
 		disconnect = 6,
+		// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port) ---
+		// Probe packets go only to capable peers (see nextPacketIsProbe gate);
+		// older peers never see this value, so mixed populations are safe.
+		probe = 7,
+		// --- ASHFRAME CUSTOM (MTU probing) ---
 	};
 
 	const ConfirmationData = struct {
@@ -1545,7 +1712,11 @@ pub const Connection = struct { // MARK: Connection
 
 	lossyChannel: Channel, // TODO: Actually allow it to be lossy
 	secureChannel: SecureChannel,
-	slowChannel: Channel,
+	// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port): slow doubles
+	// as the probe channel. Same channel id (.slow) and traffic — chunks,
+	// lightmaps and everything else on .slow is untouched; a probe goes out
+	// only when there is nothing else to send. ---
+	slowChannel: ProbeChannel,
 
 	restartChannelCounter: [3]u32 = .{0, 0, 0},
 	restartCounter: u32 = 0,
@@ -1558,6 +1729,8 @@ pub const Connection = struct { // MARK: Connection
 	nextConfirmationTimestamp: i64,
 	queuedConfirmations: main.utils.CircularBufferQueue(ConfirmationData),
 	mtuEstimate: u16 = minMtu,
+	// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port) ---
+	mtuProbingState: ProbingState,
 
 	bandwidthEstimateInBytesPerRtt: f32 = minMtu,
 	slowStart: bool = true,
@@ -1593,6 +1766,7 @@ pub const Connection = struct { // MARK: Connection
 			.slowChannel = .init(main.random.nextInt(SequenceIndex, &main.seed), 100*ms, .slow),
 			.connectionIdentifier = networkTimestamp(),
 			.remoteConnectionIdentifier = 0,
+			.mtuProbingState = .{.searching = .{}},
 		};
 		errdefer {
 			result.lossyChannel.deinit();
@@ -1727,6 +1901,18 @@ pub const Connection = struct { // MARK: Connection
 			self.rttEstimate *= 1.5;
 			self.bandwidthEstimateInBytesPerRtt /= 2;
 			self.bandwidthEstimateInBytesPerRtt = @max(self.bandwidthEstimateInBytesPerRtt, minMtu);
+			// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port):
+			// path may have changed; drop back to minimum and re-search
+			// after a short cooldown. Ours takes priority otherwise: the
+			// PR-3191 ramp and backpressure above are untouched. ---
+			// until the handShake is done, we don't probe so it also doesn't need to be reset
+			if (self.handShakeState.load(.acquire) == .complete) {
+				self.mtuEstimate = minMtu;
+				self.mtuProbingState = .{.searchFinished = .{
+					.timestamp = networkTimestamp(),
+					.pmtuRaiseTimer = 5*1000*ms,
+				}};
+			}
 		}
 	}
 
@@ -1757,6 +1943,8 @@ pub const Connection = struct { // MARK: Connection
 				.lossy => self.lossyChannel.receiveConfirmationAndGetTimestamp(start) orelse continue,
 				.secure => self.secureChannel.receiveConfirmationAndGetTimestamp(start) orelse continue,
 				.slow => self.slowChannel.receiveConfirmationAndGetTimestamp(start) orelse continue,
+				// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port) ---
+				.probe => self.mtuProbingState.receiveConfirmationAndGetTimestamp(self, start) orelse continue,
 				else => return error.Invalid,
 			};
 			const rtt: f32 = @floatFromInt(@max(1, timestamp -% confirmationResult.timestamp -% timeOffset));
@@ -1917,6 +2105,16 @@ pub const Connection = struct { // MARK: Connection
 					});
 				}
 			},
+			// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port):
+			// confirm the probe and nothing more (no resend, no buffers). ---
+			.probe => {
+				const start = try reader.readInt(SequenceIndex);
+				self.queuedConfirmations.pushBack(.{
+					.channel = channel,
+					.start = start,
+					.receiveTimeStamp = networkTimestamp(),
+				});
+			},
 			.confirmation => {
 				try self.receiveConfirmationPacket(&reader, networkTimestamp());
 			},
@@ -1955,7 +2153,7 @@ pub const Connection = struct { // MARK: Connection
 				writer.writeInt(i64, self.connectionIdentifier);
 				writer.writeInt(SequenceIndex, self.lossyChannel.sendBuffer.fullyConfirmedIndex);
 				writer.writeInt(SequenceIndex, self.secureChannel.super.sendBuffer.fullyConfirmedIndex);
-				writer.writeInt(SequenceIndex, self.slowChannel.sendBuffer.fullyConfirmedIndex);
+				writer.writeInt(SequenceIndex, self.slowChannel.super.sendBuffer.fullyConfirmedIndex);
 				_ = internalMessageOverhead.fetchAdd(writer.data.items.len + headerOverhead, .monotonic);
 				self.manager.send(writer.data.items, self.remoteAddress, null);
 				return;

@@ -250,6 +250,12 @@ pub const launchConfig = struct {
 	/// Vanilla clients never announce, so they always get the full pack.
 	pub var ashframePackSkip: bool = true;
 	// --- ASHFRAME CUSTOM (UX-6) ---
+	// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port) ---
+	/// RFC 8899 path-MTU discovery. Probes go only to Argon peers with
+	/// `ashframeClientVersion >= mtuProbeVersion`; vanilla/old clients never
+	/// see the probe channel. Kill-switch: false disables all probing.
+	pub var mtuProbing: bool = true;
+	// --- ASHFRAME CUSTOM (MTU probing) ---
 	// --- ASHFRAME CUSTOM (Bisect toggles) ---
 
 	pub var vulkanTestingMode: bool = false;
@@ -276,6 +282,7 @@ pub const launchConfig = struct {
 		serverAuthoritativeCharges = zon.get(bool, "serverAuthoritativeCharges") orelse serverAuthoritativeCharges;
 		// --- ASHFRAME CUSTOM (UX-6: asset pack skip) ---
 		ashframePackSkip = zon.get(bool, "ashframePackSkip") orelse ashframePackSkip;
+		mtuProbing = zon.get(bool, "mtuProbing") orelse mtuProbing;
 		// --- ASHFRAME CUSTOM (UX-6) ---
 		// --- ASHFRAME CUSTOM (UX-3: tunable worker count) ---
 		// `cpuThreads` existed but was never loaded, so the pool was always

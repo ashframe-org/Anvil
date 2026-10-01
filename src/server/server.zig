@@ -355,6 +355,12 @@ pub const User = struct { // MARK: User
 		return v >= minArgonVersion;
 	}
 	// --- ASHFRAME CUSTOM (capability handshake) ---
+	// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port) ---
+	/// Argon client version that supports MTU probe traffic (channel 7).
+	/// Peers below this never see a probe packet, so mixed populations are
+	/// safe. Bump `ashframe_client.clientVersion` to match when porting.
+	pub const mtuProbeVersion: u16 = 2;
+	// --- ASHFRAME CUSTOM (MTU probing) ---
 
 	/// Starts the teleport view ramp. Called from the single teleport choke point
 	/// (`genericUpdate.sendTPCoordinates`), so every teleport - command or block -
@@ -911,7 +917,7 @@ pub const User = struct { // MARK: User
 		// distance cut). Pause dispatch while either channel is too full;
 		// tasks wait in the queue (never dropped — the client won't retry).
 		if (self.conn.secureChannel.super.sendBuffer.buffer.len > 900000) return true;
-		return self.conn.slowChannel.sendBuffer.buffer.len > 900000;
+		return self.conn.slowChannel.super.sendBuffer.buffer.len > 900000;
 		// --- ASHFRAME CUSTOM (UX-1b) ---
 	}
 
