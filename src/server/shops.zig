@@ -145,22 +145,23 @@ pub fn signIsLight(block: main.blocks.Block) bool {
 /// don't overflow the sign.
 pub const maxNameLen: usize = 16;
 
-/// Strips Cubyz color codes (§#rrggbb) and truncates to `maxNameLen` bytes at a
-/// valid UTF-8 boundary. Writes into `buf` and returns the used slice.
+/// Cleans a player name with the shared engine-faithful cleaner (strips both
+/// `§#rrggbb` and bare `#rrggbb`, markdown, trims/collapses spaces), then
+/// truncates VISIBLE bytes to `maxNameLen` at a UTF-8 boundary. The old
+/// version counted raw bytes (color codes included), so a color-per-letter
+/// name like Fabrovio's truncated to just "F".
 pub fn signName(name: []const u8, buf: *[maxNameLen]u8) []const u8 {
+	var tmp = main.ListManaged(u8).init(main.stackAllocator);
+	defer tmp.deinit();
+	main.server.veterans.appendCleaned(&tmp, name);
 	var len: usize = 0;
-	var i: usize = 0;
-	while (i < name.len and len < maxNameLen) {
-		if (std.mem.startsWith(u8, name[i..], "\u{00a7}")) {
-			i += 1;
-			if (i < name.len and name[i] == '#') i += 7;
-			continue;
-		}
-		buf[len] = name[i];
-		len += 1;
-		i += 1;
+	while (len < tmp.items.len and len < maxNameLen) {
+		const l = main.server.veterans.utf8Len(tmp.items, len);
+		if (len + l > maxNameLen) break;
+		len += l;
 	}
-	while (len > 0 and !std.unicode.utf8ValidateSlice(buf[0..len])) len -= 1;
+	while (len > 0 and !std.unicode.utf8ValidateSlice(tmp.items[0..len])) len -= 1;
+	@memcpy(buf[0..len], tmp.items[0..len]);
 	return buf[0..len];
 }
 
@@ -972,37 +973,29 @@ pub fn refreshSigns() usize {
 	return pending;
 }
 
-fn isHex6(s: []const u8) bool {
-	if (s.len < 6) return false;
-	for (s[0..6]) |c| {
-		if (!std.ascii.isHex(c)) return false;
-	}
-	return true;
-}
-
-/// Owner display name from existing sign text: the last line, minus `#rrggbb`
-/// color codes. Shop signs have always stored the (code-stripped) owner name
-/// there, so migration can re-render without the owner online. Null when
-/// there is no usable name (empty, or longer than `buf` — in which case the
-/// sign is left alone rather than truncated).
+/// Owner display name from existing sign text: the cleaned last line.
+/// Shop signs store the owner name there, so migration can re-render
+/// without the owner online. Null when there is no usable name (empty —
+/// in which case the sign is left alone).
+/// Uses the shared engine-faithful cleaner so owner read-back agrees with
+/// what `signName` wrote (bare `#rrggbb` included); truncates to `buf` at a
+/// UTF-8 boundary instead of bailing on long lines.
 fn lastTextLine(text: []const u8, buf: []u8) ?[]const u8 {
+	const line = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |nl| text[nl + 1 ..] else text;
+	var tmp = main.ListManaged(u8).init(main.stackAllocator);
+	defer tmp.deinit();
+	main.server.veterans.appendCleaned(&tmp, std.mem.trim(u8, line, " \r\t"));
+	if (tmp.items.len == 0) return null;
 	var len: usize = 0;
-	var i: usize = 0;
-	while (i < text.len) {
-		if (text[i] == '#' and isHex6(text[i + 1 ..])) {
-			i += 7;
-			continue;
-		}
-		if (len >= buf.len) return null;
-		buf[len] = text[i];
-		len += 1;
-		i += 1;
+	while (len < tmp.items.len and len < buf.len) {
+		const l = main.server.veterans.utf8Len(tmp.items, len);
+		if (len + l > buf.len) break;
+		len += l;
 	}
-	const stripped = buf[0..len];
-	const line = if (std.mem.lastIndexOfScalar(u8, stripped, '\n')) |nl| stripped[nl + 1 ..] else stripped;
-	const name = std.mem.trim(u8, line, " \r\t");
-	if (name.len == 0) return null;
-	return name;
+	while (len > 0 and !std.unicode.utf8ValidateSlice(tmp.items[0..len])) len -= 1;
+	if (len == 0) return null;
+	@memcpy(buf[0..len], tmp.items[0..len]);
+	return buf[0..len];
 }
 
 /// Rewrites one shop sign with the sign-aware colors. True = done (or
@@ -1052,6 +1045,25 @@ test "shop sign schemes" {
 	try std.testing.expect(owner != null and std.mem.eql(u8, owner.?, "Bob"));
 	const empty = lastTextLine("#ffcc00[Shop] Sell#ffffff\n", &nb);
 	try std.testing.expect(empty == null);
+}
+
+test "shop signName uses the shared cleaner (bare color codes don't count)" {
+	var buf: [maxNameLen]u8 = undefined;
+	// Fabrovio's color-per-letter name: old code counted raw bytes and kept "F".
+	try std.testing.expectEqualStrings("Fabrovio", signName("__#006fbaF#1f76bea#3e7cc1b#3e7cc1r#7c89c8o#ba96cfv#d99cd3i#f7a2d6o", &buf));
+	// §-prefixed and plain names.
+	try std.testing.expectEqualStrings("iNiKKo", signName("#00FFFFiNiKKo", &buf));
+	try std.testing.expectEqualStrings("Bob", signName("Bob", &buf));
+	try std.testing.expectEqualStrings("", signName("", &buf));
+	// Visible cap still applies, at a UTF-8 boundary.
+	try std.testing.expectEqualStrings("0123456789ABCDEF", signName("0123456789ABCDEFgh", &buf));
+	const emo = signName("0123456789ABCDE🐁x", &buf);
+	try std.testing.expect(std.unicode.utf8ValidateSlice(emo));
+	try std.testing.expect(emo.len <= maxNameLen);
+	// lastTextLine agrees with signName on decorated owner lines.
+	var nb2: [64]u8 = undefined;
+	const owner = lastTextLine("#ffcc00[Shop] Sell#ffffff\n-5x ruby\n+2x amber\n__#006fbaF#1f76bea#3e7cc1b#3e7cc1r#7c89c8o#ba96cfv#d99cd3i#f7a2d6o", &nb2);
+	try std.testing.expect(owner != null and std.mem.eql(u8, owner.?, "Fabrovio"));
 }
 
 test "shop sign attachment is side-mount only" {

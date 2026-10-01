@@ -121,7 +121,8 @@ fn appendSpace(out: *main.ListManaged(u8), c: u8) void {
 }
 
 /// Length in bytes of the UTF-8 codepoint at name[i] (1..4).
-fn utf8Len(name: []const u8, i: usize) usize {
+/// Shared with shops (visible-length truncation at codepoint boundaries).
+pub fn utf8Len(name: []const u8, i: usize) usize {
 	if (i >= name.len) return 0;
 	const c = name[i];
 	if (c < 0x80) return 1;
@@ -217,8 +218,11 @@ fn isExcluded(cleanedName: []const u8) bool {
 	return false;
 }
 
-/// Grants any veteran seasons matching this player (key first, then name).
-/// Safe to call on every join: already-set bits are skipped silently.
+/// Grants any veteran seasons matching this player: the UNION of all key
+/// matches and all name matches. Key-only-then-name used to let a key entry
+/// shadow name entries (a player whose key row lacked S1 never got it via
+/// their name row). Union only ever adds bits, never removes. Safe to call
+/// on every join: already-set bits are skipped silently.
 pub fn grant(user: *User) void {
 	load();
 	const prof = user.player();
@@ -234,11 +238,10 @@ pub fn grant(user: *User) void {
 		for (keys.items) |entry| {
 			if (std.mem.eql(u8, entry.key, key)) {
 				mask |= entry.seasons;
-				break;
 			}
 		}
 	}
-	if (mask == 0) {
+	{
 		var cleaned = main.ListManaged(u8).init(main.stackAllocator);
 		defer cleaned.deinit();
 		appendCleaned(&cleaned, user.name);
