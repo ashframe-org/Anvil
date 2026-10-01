@@ -79,6 +79,13 @@ const Socket = struct { // MARK: Socket
 			},
 		};
 		errdefer self.deinit();
+		// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 follow-up) ---
+		// Set DF once for the socket's lifetime so oversized probes are
+		// DROPPED, not fragmented (RFC 8899). Without this, probes measure
+		// the fragmentation ceiling (~64K) instead of the path MTU. Best
+		// effort: failure only degrades discovery, so warn and continue.
+		// Single network thread => no flag-flapping hazard.
+		self.setDontFragment();
 		const bindingAddr = posix.sockaddr.in{
 			.port = @byteSwap(localPort),
 			.addr = 0,
@@ -113,6 +120,25 @@ const Socket = struct { // MARK: Socket
 				else => {
 					std.log.warn("Got error while closing socket: {s}", .{@tagName(err)});
 				},
+			}
+		}
+	}
+
+	// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 follow-up) ---
+	fn setDontFragment(self: Socket) void {
+		if (builtin.os.tag == .windows) {
+			// NOTE: compile-unverified (no Windows builder here); standard
+			// Winsock2 names. Failure only degrades MTU accuracy.
+			var dont: c_int = 1;
+			if (c.setsockopt(self.socketID, c.IPPROTO_IP, c.IP_DONTFRAGMENT, @ptrCast(&dont), @intCast(@sizeOf(@TypeOf(dont)))) != 0) {
+				std.log.warn("Could not set DF flag on socket, MTU probing may overestimate.", .{});
+			}
+		} else {
+			const probe: c_int = std.c.IP.PMTUDISC_PROBE;
+			const result = std.c.setsockopt(self.socketID, std.c.IPPROTO.IP, std.c.IP.MTU_DISCOVER, &probe, @sizeOf(c_int));
+			switch (std.c.errno(result)) {
+				.SUCCESS => {},
+				else => |e| std.log.warn("Could not set DF flag on socket ({t}), MTU probing may overestimate.", .{e}),
 			}
 		}
 	}
@@ -1319,6 +1345,10 @@ pub const Connection = struct { // MARK: Connection
 		const probeTimer: i64 = 15*1000*ms;
 		/// max probes are done until the probing is seen as failed (RFC default: 3)
 		const maxProbes: u8 = 3;
+		// --- ASHFRAME CUSTOM (MTU probing follow-up): hard ceiling so a
+		// path that fragments instead of dropping (DF ineffective) can
+		// never ratchet into the 64K zone. Generous enough for jumbo LANs.
+		const maxProbeSize: u16 = 8192;
 
 		var nextIndex: SequenceIndex = 0;
 
@@ -1348,7 +1378,7 @@ pub const Connection = struct { // MARK: Connection
 			if (!u.isArgon() or (u.ashframeClientVersion orelse 0) < main.server.User.mtuProbeVersion) return false;
 			switch (self.*) {
 				.searching => |*state| {
-					if (conn.mtuEstimate >= Connection.maxMtu - 50) {
+					if (conn.mtuEstimate >= maxProbeSize) {
 						self.* = .{.searchFinished = .{
 							.timestamp = time,
 						}};
@@ -1371,7 +1401,7 @@ pub const Connection = struct { // MARK: Connection
 					if (time - state.timestamp <= state.pmtuRaiseTimer) {
 						return false;
 					}
-					if (conn.mtuEstimate >= Connection.maxMtu - 50) return false;
+					if (conn.mtuEstimate >= maxProbeSize) return false;
 					self.* = .{.searching = .{}};
 					return true;
 				},
@@ -1380,7 +1410,7 @@ pub const Connection = struct { // MARK: Connection
 
 		fn nextProbeSize(self: *ProbingState, conn: *Connection) u16 {
 			std.debug.assert(self.* == .searching);
-			self.searching.probedSize = @min(conn.mtuEstimate, Connection.maxMtu - 50) + 50;
+			self.searching.probedSize = @min(conn.mtuEstimate, maxProbeSize - 50) + 50;
 			return self.searching.probedSize;
 		}
 
