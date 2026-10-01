@@ -30,6 +30,7 @@ Custom Cubyz **0.4.1** server ([upstream](https://github.com/PixelGuys/Cubyz)). 
 | `/playtime` / `/playtime list` | Your playtime / leaderboard. |
 | `/stats` | Your stats. |
 | `/avatar` | Change model (also name lookup). |
+| `/avatar list` | All wearable models (cubyz: + skinz:). |
 | `/afk` | Toggle AFK (also auto after 5 min idle). |
 | `/players` | Online players. |
 | `/kill @<i>` or `/kill <name>` | Kill a player. |
