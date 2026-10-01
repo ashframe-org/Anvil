@@ -203,6 +203,16 @@ pub const handShake = struct { // MARK: handShake
 						conn.user.?.ashframePackHash = @bitCast(h);
 					}
 					// --- ASHFRAME CUSTOM (UX-6) ---
+					// --- ASHFRAME CUSTOM (capability handshake) ---
+					// Argon announces its feature version; vanilla omits it.
+					// Unknown fields are ignored by vanilla, so this is safe.
+					if (zon.get(i64, "ashframeClientVersion")) |v| {
+						if (v >= 0 and v <= std.math.maxInt(u16)) {
+							conn.user.?.ashframeClientVersion = @intCast(v);
+							std.log.info("User {s} is Argon v{d}", .{ name, v });
+						}
+					}
+					// --- ASHFRAME CUSTOM (capability handshake) ---
 
 					if (!try settings.version.isCompatibleClientVersion(version)) {
 						std.log.warn("Version incompatible with server version {s}", .{settings.version.version});
@@ -1137,7 +1147,13 @@ pub const lightMapTransmission = struct { // MARK: lightMapTransmission
 		writer.writeInt(i32, map.pos.wy);
 		writer.writeInt(u8, map.pos.voxelSizeShift);
 		writer.writeSlice(compressedData);
-		conn.send(.secure, id, writer.data.items); // TODO: Can this use the slow channel?
+		// --- ASHFRAME CUSTOM (UX-1c: lightmaps on the slow channel) ---
+		// Same rationale as UX-1 for chunks: lightmap bursts rode `.secure`
+		// and head-of-line-blocked gameplay acks. `.slow` is a stock channel
+		// and dispatch is by protocol id, so vanilla clients handle it
+		// natively and the UX-1b 900 KB backpressure (channel-wide) covers it.
+		conn.send(.slow, id, writer.data.items);
+		// --- ASHFRAME CUSTOM (UX-1c) ---
 	}
 };
 
@@ -1288,6 +1304,8 @@ pub const blockEntityUpdate = struct { // MARK: blockEntityUpdate
 		defer main.stackAllocator.free(users);
 
 		for (users) |user| {
+			// --- ASHFRAME CUSTOM (interest gating) ---
+			if (!user.canSeeBlock(pos[0], pos[1], pos[2])) continue;
 			blockUpdate.send(user.conn, &.{.{.pos = pos, .newBlock = block, .blockEntityData = writer.data.items}});
 		}
 	}

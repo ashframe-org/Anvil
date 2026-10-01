@@ -702,7 +702,11 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 		self.settings = try .fromZon(worldData.getChild("settings"));
 
 		self.doGameTimeCycle = worldData.get(bool, "doGameTimeCycle") orelse true;
-		self.gameTime = worldData.get(i64, "gameTime") orelse 0;
+		// --- ASHFRAME CUSTOM (day-on-restart): the persisted clock resumes
+		// midnight-ish after a restart, so joins open at night. Start each
+		// load at the morning mark instead (cycle pos 0 = dayStart). ---
+		self.gameTime = 0;
+		// --- ASHFRAME CUSTOM (day-on-restart) ---
 		self.spawn = worldData.get(Vec3i, "spawn") orelse .{0, 0, 0};
 		self.biomeChecksum = worldData.get(i64, "biomeChecksum") orelse 0;
 		self.name = main.globalAllocator.dupe(u8, worldData.get([]const u8, "name") orelse self.path);
@@ -1170,6 +1174,8 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 				const nb = self.getBlock(nx, ny, nz) orelse continue;
 				if (!main.blocks.isOre(nb)) continue;
 				for (userList) |user| {
+					// --- ASHFRAME CUSTOM (interest gating) ---
+					if (!user.canSeeBlock(nx, ny, nz)) continue;
 					main.network.protocols.blockUpdate.send(user.conn, &.{.{.pos = .{nx, ny, nz}, .newBlock = nb, .blockEntityData = &.{}}});
 				}
 			}
@@ -1199,6 +1205,9 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 			for (userList) |user| {
 				main.network.protocols.genericUpdate.sendTime(user.conn, self);
 			}
+			// --- ASHFRAME CUSTOM (drop interest gating): catch-up sweep for
+			// players that walked into range of unseen drops. ---
+			self.itemDropManager.syncVisibleDrops(userList);
 		}
 		self.processPendingOreReveal();
 		self.tick();
@@ -1446,6 +1455,9 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 				defer main.stackAllocator.free(userList);
 
 				for (userList) |user| {
+					// --- ASHFRAME CUSTOM (interest gating): only players that
+					// hold the chunk need this. Far clients drop it anyway. ---
+					if (!user.canSeeBlock(wx +% neighbor.relX(), wy +% neighbor.relY(), wz +% neighbor.relZ())) continue;
 					main.network.protocols.blockUpdate.send(user.conn, &.{.{.pos = .{wx +% neighbor.relX(), wy +% neighbor.relY(), wz +% neighbor.relZ()}, .newBlock = neighborBlock, .blockEntityData = &.{}}});
 				}
 			}
@@ -1469,6 +1481,9 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 		defer main.stackAllocator.free(userList);
 
 		for (userList) |user| {
+			// --- ASHFRAME CUSTOM (interest gating): only players that hold
+			// the chunk need this. Far clients drop it anyway. ---
+			if (!user.canSeeBlock(wx, wy, wz)) continue;
 			main.network.protocols.blockUpdate.send(user.conn, &.{.{.pos = .{wx, wy, wz}, .newBlock = newBlock, .blockEntityData = &.{}}});
 		}
 		// --- ASHFRAME CUSTOM (Anti-xray): ores exposed by this change ---

@@ -228,6 +228,19 @@ pub const User = struct { // MARK: User
 	/// Null = vanilla/uncached: always send the full pack.
 	ashframePackHash: ?u64 = null,
 	// --- ASHFRAME CUSTOM (UX-6) ---
+	// --- ASHFRAME CUSTOM (capability handshake) ---
+	/// Argon capability version announced in userData (`ashframeClientVersion`).
+	/// Null = vanilla (or pre-versioning Argon): stock payloads only.
+	/// Bump `minArgonVersion` when depending on newer client features.
+	ashframeClientVersion: ?u16 = null,
+	// --- ASHFRAME CUSTOM (capability handshake) ---
+	// --- ASHFRAME CUSTOM (drop interest gating) ---
+	/// Drops this player has received an add for. Removes go only to players
+	/// with the bit set (they are the only ones that can hold the drop);
+	/// adds go only to in-range players without the bit; a 2 s sweep covers
+	/// players who walk into range. 8 KB inline, no alloc/deinit needed.
+	seenDrops: std.bit_set.ArrayBitSet(usize, main.itemdrop.ItemDropManager.maxCapacity) = .empty,
+	// --- ASHFRAME CUSTOM (drop interest gating) ---
 
 	inventoryClientToServerIdMap: std.AutoHashMap(InventoryId, InventoryId) = undefined,
 	inventory: ?InventoryId = null,
@@ -330,6 +343,19 @@ pub const User = struct { // MARK: User
 		return &self.innerPlayer;
 	}
 
+	// --- ASHFRAME CUSTOM (capability handshake) ---
+	/// Minimum Argon client version we gate features on. Bump when
+	/// depending on newer client capabilities.
+	pub const minArgonVersion: u16 = 1;
+
+	/// True for Argon clients at/above the supported version. Vanilla (and
+	/// pre-versioning Argon) get stock payloads only.
+	pub fn isArgon(self: *const User) bool {
+		const v = self.ashframeClientVersion orelse return false;
+		return v >= minArgonVersion;
+	}
+	// --- ASHFRAME CUSTOM (capability handshake) ---
+
 	/// Starts the teleport view ramp. Called from the single teleport choke point
 	/// (`genericUpdate.sendTPCoordinates`), so every teleport - command or block -
 	/// is covered without the client having to say anything.
@@ -375,6 +401,25 @@ pub const User = struct { // MARK: User
 			@as(f64, @floatFromInt(main.chunk.chunkSize)) *
 			@as(f64, @floatFromInt(voxelSize));
 	}
+
+	// --- ASHFRAME CUSTOM (interest gating) ---
+	/// Interest gate for block/item/entity broadcasts: true if the block is
+	/// inside this player's keep radius (they have, or are loading, the chunk)
+	/// and their connection is live. Far-away clients dropped these packets
+	/// anyway (no mesh -> ignored; unknown entity/drop -> skipped), so not
+	/// sending them only saves N× traffic on reliable channels. The radius is
+	/// deliberately larger than the client's render distance, so no VISIBLE
+	/// update is ever gated.
+	pub fn canSeeBlock(self: *User, wx: i32, wy: i32, wz: i32) bool {
+		if (self.conn.connectionState.load(.monotonic) != .connected) return false;
+		const p = self.livePosBlock();
+		const r = self.keepRadiusBlocks(1);
+		const dx: f64 = @floatFromInt(@as(i64, wx) - @as(i64, p[0]));
+		const dy: f64 = @floatFromInt(@as(i64, wy) - @as(i64, p[1]));
+		const dz: f64 = @floatFromInt(@as(i64, wz) - @as(i64, p[2]));
+		return dx*dx + dy*dy + dz*dz <= r*r;
+	}
+	// --- ASHFRAME CUSTOM (interest gating) ---
 
 	/// Effective distance forced by an active teleport ramp: starts at
 	/// `teleportRampFromRD` and expands linearly to the client's distance.
@@ -1166,7 +1211,17 @@ fn update() void { // MARK: update()
 		});
 	}
 	for (userList) |user| {
-		main.network.protocols.entityPosition.send(user.conn, user.player().pos, entityData.items, itemData);
+		// --- ASHFRAME CUSTOM (interest gating): per-tick drop positions go
+		// only to players in range of each drop. Player entities stay ungated
+		// (few, cheap, always rendered). Positions are ephemeral state, so no
+		// seen-tracking is needed — unlike adds/removes. ---
+		var nearItems: main.ListManaged(main.itemdrop.ItemDropNetworkData) = .init(main.stackAllocator);
+		defer nearItems.deinit();
+		for (itemData) |drop| {
+			if (!user.canSeeBlock(@intFromFloat(@trunc(drop.pos[0])), @intFromFloat(@trunc(drop.pos[1])), @intFromFloat(@trunc(drop.pos[2])))) continue;
+			nearItems.append(drop);
+		}
+		main.network.protocols.entityPosition.send(user.conn, user.player().pos, entityData.items, nearItems.items);
 	}
 
 	for (userList) |user| {
@@ -1342,12 +1397,12 @@ pub fn connectInternal(user: *User) void {
 	// Operators also get chat feedback when their dynamic render distance changes.
 	user.perfDebug = user.anticheatStaff;
 	main.network.protocols.handShake.sendServerPlayerData(user.conn);
+	user.conn.handShakeState.store(.complete, .monotonic);
 	// --- ASHFRAME CUSTOM (join-time sync): push the clock immediately so
-	// joining clients don't render noon until the 2 s tick. Stock `.time`
-	// packet — vanilla clients parse it identically. ---
+	// joining clients don't render noon until the 2 s tick. MUST be after
+	// .complete or Connection.send drops it (protocol 9). Stock packet. ---
 	main.network.protocols.genericUpdate.sendTime(user.conn, world.?);
 	// --- ASHFRAME CUSTOM (join-time sync) ---
-	user.conn.handShakeState.store(.complete, .monotonic);
 
 	// TODO: addEntity(player);
 	const userList = getUserList(main.stackAllocator);
@@ -1390,7 +1445,14 @@ pub fn connectInternal(user: *User) void {
 	const initialList = getInitialEntityList(main.stackAllocator);
 	main.network.protocols.entity.send(user.conn, initialList);
 	main.stackAllocator.free(initialList);
+	// --- ASHFRAME CUSTOM (drop interest gating): the join snapshot holds
+	// every live drop — mark them seen so the catch-up sweep never re-sends
+	// them as duplicate adds (unguarded clients crash on duplicates). ---
+	world.?.itemDropManager.markAllSeenBy(user);
 	sendMessage("{s}§#8a8a8a joined", .{user.name});
+	// --- ASHFRAME CUSTOM (Shop status report) ---
+	main.server.shops.reportOnJoin(user);
+	// --- ASHFRAME CUSTOM (Shop status report) ---
 	// --- ASHFRAME CUSTOM (Server report) ---
 	report.recordJoin(user.name);
 	report.maybeShowReport(user);
@@ -1470,19 +1532,133 @@ pub fn messageFrom(msg: []const u8, source: *User) void { // MARK: message
 	var tag: main.ListManaged(u8) = .init(main.stackAllocator);
 	defer tag.deinit();
 	titles.appendChatTag(&tag, source);
-	// The prefix/title tags above can carry their own §#rrggbb color code, so the
-	// name is explicitly reset to plain white after them (readability).
-	sendMessage("{s}§#ffffff{s}§#8a8a8a > §#ffffff{s}", .{tag.items, source.name, clean_msg});
+	// --- ASHFRAME CUSTOM (@mention ping): the mentioned online user gets a
+	// version with the @name highlighted gold, and is EXCLUDED from the
+	// normal broadcast so they don't see the line twice. ---
+	const mentioned = findMentionedUser(source, clean_msg);
+	const line = main.stackAllocator.print("{s}§#ffffff{s}§#8a8a8a > §#ffffff{s}", .{ tag.items, source.name, clean_msg });
+	defer main.stackAllocator.free(line);
+	sendRawMessageExcept(line, mentioned);
+	if (mentioned) |m| {
+		var tok: usize = 0;
+		while (std.mem.indexOfScalarPos(u8, clean_msg, tok, '@')) |pos| {
+			tok = pos + 1;
+			var e = tok;
+			while (e < clean_msg.len and !std.ascii.isWhitespace(clean_msg[e])) e += 1;
+			var plainBuf: [128]u8 = undefined;
+			if (eqlIgnoreCasePlain(m.name, clean_msg[tok..e], &plainBuf)) {
+				sendMentionCopy(source, tag.items, clean_msg, m, clean_msg[tok..e]);
+				break;
+			}
+		}
+	}
+	// --- ASHFRAME CUSTOM (@mention ping) ---
 	// --- ASHFRAME CUSTOM (Title tracking) ---
 }
 
+// --- ASHFRAME CUSTOM (@mention ping) ---
+/// True if `rawToken` equals `name` with all colour codes stripped.
+fn eqlIgnoreCasePlain(name: []const u8, rawToken: []const u8, buf: []u8) bool {
+	return std.ascii.eqlIgnoreCase(plainName(name, buf), rawToken);
+}
+
+// --- ASHFRAME CUSTOM (@mention ping) ---
+/// Plain (no colour codes) form of a display name. Handles BOTH `§#rrggbb`
+/// and a bare `#rrggbb` prefix (Ashframe names use the bare form).
+fn plainName(name: []const u8, buf: []u8) []const u8 {
+	var n: usize = 0;
+	var i: usize = 0;
+	while (i < name.len and n < buf.len) {
+		if (std.mem.startsWith(u8, name[i..], "§")) {
+			i += "§".len;
+			if (i < name.len and name[i] == '#') i += 7 else if (i < name.len) i += 1;
+			continue;
+		}
+		if (name[i] == '#' and i + 7 <= name.len and isHex6(name[i + 1 .. i + 7])) {
+			i += 7;
+			continue;
+		}
+		buf[n] = name[i];
+		n += 1;
+		i += 1;
+	}
+	return buf[0..n];
+}
+
+fn isHex6(s: []const u8) bool {
+	if (s.len != 6) return false;
+	for (s) |ch| {
+		if (!std.ascii.isHex(ch)) return false;
+	}
+	return true;
+}
+
+/// The online user named by an `@token` in `msg`, or null. Only the FIRST
+/// mention is resolved (avoid duplicate pings).
+fn findMentionedUser(source: *User, msg: []const u8) ?*User {
+	const userList = getUserList(main.stackAllocator);
+	defer main.stackAllocator.free(userList);
+	var at: usize = 0;
+	while (std.mem.indexOfScalarPos(u8, msg, at, '@')) |pos| {
+		at = pos + 1;
+		var end = at;
+		while (end < msg.len and !std.ascii.isWhitespace(msg[end])) end += 1;
+		const token = msg[at..end];
+		if (token.len == 0) continue;
+		for (userList) |u| {
+			if (u == source) continue;
+			var plainBuf: [128]u8 = undefined;
+			const plain = plainName(u.name, &plainBuf);
+			if (std.ascii.eqlIgnoreCase(plain, token)) return u;
+		}
+	}
+	return null;
+}
+
+/// Send `target` the chat line with `token` highlighted gold. Built once;
+/// never broadcast, so no duplicate reaches the mentioned user.
+fn sendMentionCopy(source: *User, tag: []const u8, msg: []const u8, target: *User, token: []const u8) void {
+	var out: main.ListManaged(u8) = .init(main.stackAllocator);
+	defer out.deinit();
+	out.appendSlice(tag);
+	out.appendSlice("§#ffffff");
+	out.appendSlice(source.name);
+	out.appendSlice("§#8a8a8a > §#ffffff");
+	var j: usize = 0;
+	var it: usize = 0;
+	while (std.mem.indexOfScalarPos(u8, msg, it, '@')) |p| {
+		if (p > j) out.appendSlice(msg[j..p]);
+		var e = p + 1;
+		while (e < msg.len and !std.ascii.isWhitespace(msg[e])) e += 1;
+		if (std.ascii.eqlIgnoreCase(msg[p + 1 .. e], token)) {
+			out.appendSlice("§#ffcc00@");
+			out.appendSlice(token);
+			out.appendSlice("§#ffffff");
+		} else {
+			out.appendSlice(msg[p..e]);
+		}
+		j = e;
+		it = e;
+	}
+	if (j < msg.len) out.appendSlice(msg[j..]);
+	target.sendRawMessage(out.items);
+}
+// --- ASHFRAME CUSTOM (@mention ping) ---
+
 fn sendRawMessage(msg: []const u8) void {
+	sendRawMessageExcept(msg, null);
+}
+
+/// Broadcast `msg` to everyone except `except` (used by the mention ping so
+/// the mentioned user receives only their gold copy, not a duplicate).
+fn sendRawMessageExcept(msg: []const u8, except: ?*User) void {
 	chatMutex.lock();
 	defer chatMutex.unlock();
 	main.log.chat("{s}", .{msg});
 	const userList = getUserList(main.stackAllocator);
 	defer main.stackAllocator.free(userList);
 	for (userList) |user| {
+		if (except != null and user == except.?) continue;
 		const state = user.conn.connectionState.load(.monotonic);
 		if (state != .connected) {
 			std.log.warn("[ashframe] sendRawMessage: skipping {s} user={x} conn={x} (state {s})", .{ user.name, @intFromPtr(user), @intFromPtr(user.conn), @tagName(state) });

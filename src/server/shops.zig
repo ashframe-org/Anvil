@@ -47,6 +47,11 @@ const Shop = struct {
 	goodsAmount: u16,
 	priceItem: u16,
 	priceAmount: u16,
+	// --- ASHFRAME CUSTOM (shop status report): persisted so a returning
+	// owner is told what happened while away. Not network data. ---
+	tradesSince: u32 = 0, // completed trades since the owner last joined
+	stockOut: bool = false, // recorded out-of-stock state (edge-detected)
+	// --- ASHFRAME CUSTOM (shop status report) ---
 };
 
 var shops: main.ListManaged(Shop) = undefined;
@@ -262,6 +267,75 @@ pub fn findNeighborChest(pos: Vec3i) ?Vec3i {
 	return mountedChestOfSign(pos);
 }
 
+/// Precise refusal reasons for /shop setup, so stacked-chest confusion
+/// reports exactly what's wrong instead of a generic message.
+pub const RefusalKind = enum {
+	notChestOrSign,
+	chestWithoutSign,
+	signNotSideMounted,
+	signMountedElsewhere,
+};
+
+pub const ShopPair = struct { chest: Vec3i, sign: Vec3i };
+
+pub const ResolveResult = union(enum) {
+	ok: ShopPair,
+	refuse: RefusalKind,
+};
+
+/// Details for diagnostics: nearest adjacent sign (if any) and where it is
+/// actually mounted. Render thread free; called on the server thread.
+pub const PairDiag = struct {
+	signPos: ?Vec3i = null,
+	mountData: ?u16 = null,
+	mountedPos: ?Vec3i = null,
+	mountedIsChest: bool = false,
+};
+
+/// Scan all 6 neighbors of `chest` for a sign and describe the first one
+/// found. Used only to explain refusals; validity still requires a
+/// side-mounted sign on this exact chest (see resolveShopPair).
+pub fn diagnoseChest(chest: Vec3i) PairDiag {
+	const world = main.server.world orelse return .{};
+	const offs = [_]Vec3i{
+		.{0, 0, 1}, .{0, 0, -1},
+		.{1, 0, 0}, .{-1, 0, 0},
+		.{0, 1, 0}, .{0, -1, 0},
+	};
+	for (offs) |off| {
+		const p = Vec3i{ chest[0] + off[0], chest[1] + off[1], chest[2] + off[2] };
+		const block = world.getBlock(p[0], p[1], p[2]) orelse continue;
+		if (!isSignBlock(block)) continue;
+		var diag = PairDiag{ .signPos = p, .mountData = block.data };
+		if (signAttachmentPos(p, block)) |attached| {
+			diag.mountedPos = attached;
+			const ab = world.getBlock(attached[0], attached[1], attached[2]);
+			diag.mountedIsChest = if (ab) |b| isChestBlock(b) else false;
+		}
+		return diag;
+	}
+	return .{};
+}
+
+/// Resolve the (chest, sign) pair the player means for /shop setup.
+/// Robust to stacked chests: a chest resolves to the side-mounted sign on
+/// its own faces (side mounts always share the chest's level, so stacked
+/// neighbors can't shadow each other); a sign resolves to the chest its
+/// own mount direction points at. Anything else refuses with a precise
+/// reason instead of silently picking the wrong pair.
+pub fn resolveShopPair(target: Vec3i, targetBlock: main.blocks.Block) ResolveResult {
+	if (isChestBlock(targetBlock)) {
+		if (findNeighborSign(target)) |s| return .{ .ok = .{ .chest = target, .sign = s } };
+		return .{ .refuse = .chestWithoutSign };
+	} else if (isSignBlock(targetBlock)) {
+		if (mountedChestOfSign(target)) |c| return .{ .ok = .{ .chest = c, .sign = target } };
+		// Distinguish "mounted elsewhere" from "not side-mounted at all".
+		if (signAttachmentPos(target, targetBlock)) |_| return .{ .refuse = .signMountedElsewhere };
+		return .{ .refuse = .signNotSideMounted };
+	}
+	return .{ .refuse = .notChestOrSign };
+}
+
 /// Simple ray-march from the player's eye along their look direction, returning
 /// the first solid block within `maxDist`. World coords are (x, z, vertical).
 pub fn lookAtBlock(user: *User, maxDist: f64) ?Vec3i {
@@ -274,15 +348,29 @@ pub fn lookAtBlock(user: *User, maxDist: f64) ?Vec3i {
 	const dx: f64 = dir[0];
 	const dz: f64 = dir[1];
 	const dv: f64 = dir[2];
-	var t: f64 = 0;
-	while (t <= maxDist) : (t += 0.05) {
-		const bx = main.server.anticheat.toI32(startX + dx*t) orelse return null;
-		const bz = main.server.anticheat.toI32(startZ + dz*t) orelse return null;
-		const bv = main.server.anticheat.toI32(startV + dv*t) orelse return null;
-		const block = world.getBlock(bx, bz, bv) orelse continue;
-		if (block.typ != main.blocks.Block.air.typ) return .{bx, bz, bv};
+	// A single thin ray misses a block you stand level with (eye at +1.6
+	// passes over a sign/chest in the row you occupy). Check the ray first,
+	// then a small vertical spread of parallel rays so aiming at the same
+	// height still lands on the block. Nearest hit wins.
+	var best: ?Vec3i = null;
+	var bestT: f64 = maxDist + 1;
+	const offsets = [_]f64{ 0, -0.6, -1.1, 0.6 };
+	for (offsets) |off| {
+		var t: f64 = 0;
+		while (t <= maxDist) : (t += 0.05) {
+			const bx = main.server.anticheat.toI32(startX + dx*t) orelse break;
+			const bz = main.server.anticheat.toI32(startZ + dz*t) orelse break;
+			const bv = main.server.anticheat.toI32(startV + off + dv*t) orelse break;
+			const block = world.getBlock(bx, bz, bv) orelse continue;
+			if (block.typ == main.blocks.Block.air.typ) continue;
+			if (t < bestT) {
+				bestT = t;
+				best = .{ bx, bz, bv };
+			}
+			break;
+		}
 	}
-	return null;
+	return best;
 }
 
 fn findAtChest(chest: Vec3i) ?usize {
@@ -342,11 +430,16 @@ pub fn chestOwnedByOther(user: *User, chest: Vec3i) bool {
 pub fn onBroken(pos: Vec3i, oldBlock: main.blocks.Block) void {
 	if (!isChestBlock(oldBlock) and !isSignBlock(oldBlock)) return;
 	ensure();
+	// The block that was broken decides the wording (sign vs chest).
+	const brokeSign = isSignBlock(oldBlock);
 	var i: usize = 0;
 	while (i < shops.items.len) {
 		if (eq(shops.items[i].chest, pos) or eq(shops.items[i].sign, pos)) {
 			// Drop any confirmation menus opened for this shop.
 			closeMenusAt(shops.items[i].chest);
+			// --- ASHFRAME CUSTOM (shop disband notice) ---
+			notifyOwnerDisbanded(shops.items[i].owner, brokeSign);
+			// --- ASHFRAME CUSTOM (shop disband notice) ---
 			main.globalAllocator.free(shops.items[i].owner);
 			_ = shops.swapRemove(i);
 			continue;
@@ -355,6 +448,55 @@ pub fn onBroken(pos: Vec3i, oldBlock: main.blocks.Block) void {
 	}
 	saveCurrentWorld();
 }
+
+// --- ASHFRAME CUSTOM (shop status report) ---
+/// Short, readable summary sent to the owner at join: which of their shops
+/// sold items or went out of stock while they were away. Counters are then
+/// reset so the next join only reports new activity.
+pub fn reportOnJoin(user: *User) void {
+	ensure();
+	const me = ownerId(user);
+	var sold: u32 = 0;
+	var outOfStock: u32 = 0;
+	for (shops.items) |*s| {
+		if (!std.mem.eql(u8, s.owner, me)) continue;
+		if (s.tradesSince > 0) sold += s.tradesSince;
+		if (s.stockOut) outOfStock += 1;
+	}
+	if (sold == 0 and outOfStock == 0) return;
+	if (sold > 0 and outOfStock > 0) {
+		user.sendMessage("#8a8a8a[Shops] #cfcfcfWhile you were away: #00ff00{d} sale{s}#cfcfcf · #e6312c{d} out of stock#cfcfcf. Restock or open your chests.", .{ sold, if (sold == 1) "" else "s", outOfStock });
+	} else if (sold > 0) {
+		user.sendMessage("#8a8a8a[Shops] #cfcfcfWhile you were away: #00ff00{d} sale{s}#cfcfcf. Earnings are in your shop chests.", .{ sold, if (sold == 1) "" else "s" });
+	} else {
+		user.sendMessage("#8a8a8a[Shops] #e6312c{d} of your shop{s} ran out of stock#cfcfcf. Restock to keep trading.", .{ outOfStock, if (outOfStock == 1) "" else "s" });
+	}
+	// Reset so the next join only reports new activity.
+	for (shops.items) |*s| {
+		if (!std.mem.eql(u8, s.owner, me)) continue;
+		s.tradesSince = 0;
+		s.stockOut = false;
+	}
+	saveCurrentWorld();
+}
+// --- ASHFRAME CUSTOM (shop status report) ---
+
+// --- ASHFRAME CUSTOM (shop disband notice) ---
+/// Messages the online owner that their shop was removed (chest or sign
+/// broken). Online-only, like the sale notice: no offline mail store.
+fn notifyOwnerDisbanded(owner: []const u8, brokeSign: bool) void {
+	std.log.info("[ashframe] shop disbanded for {s} (broke {s})", .{ owner, if (brokeSign) "sign" else "chest" });
+	const userList = main.server.getUserList(main.stackAllocator);
+	defer main.stackAllocator.free(userList);
+	for (userList) |u| {
+		if (std.mem.eql(u8, ownerId(u), owner)) {
+			const what = if (brokeSign) "sign" else "chest";
+			u.sendMessage("#e6312cShop disbanded#cfcfcf — you broke the {s}; this stall is no longer trading.", .{what});
+			return;
+		}
+	}
+}
+// --- ASHFRAME CUSTOM (shop disband notice) ---
 
 /// Destroys any open confirmation menu for the given shop chest. Safe if none.
 fn closeMenusAt(chest: [3]i32) void {
@@ -488,7 +630,7 @@ fn warnOwner(user: *User, chest: Vec3i) void {
 /// Executes a trade from the customer's side. Returns true on success (so the
 /// menu can close with a positive outcome), false if it was refused for any
 /// reason (the customer already got an explanatory message).
-fn doTrade(user: *User, shop: *const Shop) bool {
+fn doTrade(user: *User, shop: *Shop) bool {
 	// Bisect toggle: economy frozen while off.
 	if (!main.settings.launchConfig.serverAuthoritativeCharges) {
 		user.sendMessage("#e6312cShops are temporarily disabled.", .{});
@@ -513,6 +655,13 @@ fn doTrade(user: *User, shop: *const Shop) bool {
 	if (countItem(chestInv, customerGets.item) < customerGets.amount) {
 		if (shop.mode == .sell) {
 			user.sendMessage("#e6312cThis shop is out of stock.", .{});
+			// --- ASHFRAME CUSTOM (shop status report): flag once so the
+			// owner is told at next join. ---
+			if (!shop.stockOut) {
+				shop.stockOut = true;
+				saveCurrentWorld();
+			}
+			// --- ASHFRAME CUSTOM (shop status report) ---
 		} else {
 			user.sendMessage("#e6312cThis shop can't pay out right now.", .{});
 		}
@@ -550,6 +699,11 @@ fn doTrade(user: *User, shop: *const Shop) bool {
 	) catch "trade";
 	user.sendMessage("#00ff00{s}#00ff00.", .{summary});
 	notifyOwner(shop, summary);
+	// --- ASHFRAME CUSTOM (shop status report): record for the join report.
+	// Only count sales of the goods side (a completed sale either way). ---
+	shop.tradesSince +|= 1;
+	saveCurrentWorld();
+	// --- ASHFRAME CUSTOM (shop status report) ---
 	return true;
 }
 
@@ -744,6 +898,8 @@ pub fn load(worldPath: []const u8) void {
 			.goodsAmount = goodsAmount,
 			.priceItem = priceItem,
 			.priceAmount = priceAmount,
+			.tradesSince = entry.get(u32, "tradesSince") orelse 0,
+			.stockOut = entry.get(bool, "stockOut") orelse false,
 		});
 	}
 }
@@ -769,6 +925,8 @@ pub fn save(worldPath: []const u8) void {
 		e.put("goodsAmount", s.goodsAmount);
 		e.put("priceItem", s.priceItem);
 		e.put("priceAmount", s.priceAmount);
+		e.put("tradesSince", s.tradesSince);
+		e.put("stockOut", s.stockOut);
 		arr.array.append(e);
 	}
 	zon.put("shops", arr);
@@ -911,6 +1069,23 @@ test "shop sign attachment is side-mount only" {
 	try std.testing.expect(signMountedOn(signPos, .{.typ = 0, .data = 16}, .{99, 200, 300}));
 	try std.testing.expect(!signMountedOn(signPos, .{.typ = 0, .data = 16}, .{100, 200, 300}));
 	try std.testing.expect(!signMountedOn(signPos, .{.typ = 0, .data = 16}, .{98, 200, 300}));
+}
+
+test "stacked shop chests resolve to their own level" {
+	// Two chests stacked vertically, each with a side sign: the mount math
+	// must pair each sign with its own chest, never the neighbor above/below.
+	// (x, horizontal, vertical).
+	const chestA: Vec3i = .{50, 60, 10};
+	const chestB: Vec3i = .{50, 60, 11};
+	const signA: Vec3i = .{51, 60, 10};
+	const signB: Vec3i = .{51, 60, 11};
+	const sideMount = main.blocks.Block{ .typ = 0, .data = 16 }; // dirNegX
+	try std.testing.expect(signMountedOn(signA, sideMount, chestA));
+	try std.testing.expect(signMountedOn(signB, sideMount, chestB));
+	try std.testing.expect(!signMountedOn(signA, sideMount, chestB));
+	try std.testing.expect(!signMountedOn(signB, sideMount, chestA));
+	// A floor/ceiling-mounted sign between levels never qualifies.
+	try std.testing.expect(signAttachmentPos(signB, .{.typ = 0, .data = 8}) == null);
 }
 
 test "shop trade summary direction" {

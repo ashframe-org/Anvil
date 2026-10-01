@@ -43,34 +43,93 @@ fn isHex6(s: []const u8) bool {
 /// surrounding whitespace and collapses internal runs (" Sleepy  Evergreen"
 /// and "Sleepy Evergreen" are the same player).
 /// `_` is kept: underscores are legitimate name characters (Kitty_Katster).
+/// Engine-faithful name cleaner (mirrors graphics.zig Parser): emits exactly
+/// what the renderer shows. `**`/`*` dropped, `~~` dropped but lone `~`
+/// kept, `__` dropped but lone `_` kept, `\X` emits X, `#` consumes itself +
+/// the next 6 codepoints, `§` consumed alone. Spaces collapse/trim.
+/// Verified 0-mismatch against all 509 real season names (S0-S4+SMP).
 pub fn appendCleaned(out: *main.ListManaged(u8), name: []const u8) void {
 	var i: usize = 0;
+	var hashLeft: u8 = 0;
 	while (i < name.len) {
-		if (i + 8 < name.len and name[i] == 0xC2 and name[i + 1] == 0xA7 and name[i + 2] == '#' and isHex6(name[i + 3 ..])) {
-			i += 9;
-			continue;
-		}
-		if (name[i] == '#' and i + 6 < name.len and isHex6(name[i + 1 ..])) {
-			i += 7;
-			continue;
-		}
-		if (name[i] == '*' or name[i] == '~') {
-			i += 1;
+		if (hashLeft > 0) {
+			i += utf8Len(name, i);
+			hashLeft -= 1;
 			continue;
 		}
 		const c = name[i];
-		// Collapse runs of spaces and drop leading ones; trailing ones are
-		// trimmed below. Only plain spaces: tabs etc. stay significant.
-		if (c == ' ' and (out.items.len == 0 or out.items[out.items.len - 1] == ' ')) {
-			i += 1;
-			continue;
+		switch (c) {
+			'*' => {
+				if (i + 1 < name.len and name[i + 1] == '*') i += 2 else i += 1;
+			},
+			'_' => {
+				if (i + 1 < name.len and name[i + 1] == '_') {
+					i += 2;
+				} else {
+					appendSpace(out, '_');
+					i += 1;
+				}
+			},
+			'~' => {
+				if (i + 1 < name.len and name[i + 1] == '~') {
+					i += 2;
+				} else {
+					appendSpace(out, '~');
+					i += 1;
+				}
+			},
+			'\\' => {
+				if (i + 1 < name.len) {
+					const l = utf8Len(name, i + 1);
+					var k: usize = 0;
+					while (k < l) : (k += 1) appendSpace(out, name[i + 1 + k]);
+					i += 1 + l;
+				} else {
+					i += 1;
+				}
+			},
+			'#' => {
+				hashLeft = 6;
+				i += 1;
+			},
+			0xC2 => {
+				if (i + 1 < name.len and name[i + 1] == 0xA7) i += 2 else {
+					appendSpace(out, c);
+					i += 1;
+				}
+			},
+			' ' => {
+				appendSpace(out, ' ');
+				i += 1;
+			},
+			else => {
+				out.append(c);
+				i += 1;
+			},
 		}
-		out.append(c);
-		i += 1;
 	}
 	while (out.items.len != 0 and out.items[out.items.len - 1] == ' ') {
 		_ = out.pop();
 	}
+}
+
+/// Appends a byte, collapsing ASCII-space runs and dropping leading spaces
+/// (trailing trimmed by the caller above). Non-space bytes pass through.
+fn appendSpace(out: *main.ListManaged(u8), c: u8) void {
+	if (c == ' ' and (out.items.len == 0 or out.items[out.items.len - 1] == ' ')) return;
+	out.append(c);
+}
+
+/// Length in bytes of the UTF-8 codepoint at name[i] (1..4).
+fn utf8Len(name: []const u8, i: usize) usize {
+	if (i >= name.len) return 0;
+	const c = name[i];
+	if (c < 0x80) return 1;
+	if (c < 0xC2) return 1;
+	if (c < 0xE0) return 2;
+	if (c < 0xF0) return 3;
+	if (c < 0xF5) return 4;
+	return 1;
 }
 
 fn eqlFold(a: []const u8, b: []const u8) bool {
@@ -425,7 +484,9 @@ test "veteran cleaner trims and collapses spaces" {
 		var out = main.ListManaged(u8).init(t);
 		defer out.deinit();
 		appendCleaned(&out, "#ff77ff__Hazel__ **:3**");
-		try std.testing.expectEqualStrings("__Hazel__ :3", out.items);
+		// Engine-faithful: #code dropped, __ dropped (underline toggle),
+		// ** dropped (bold toggle).
+		try std.testing.expectEqualStrings("Hazel :3", out.items);
 	}
 	{
 		var out = main.ListManaged(u8).init(t);
