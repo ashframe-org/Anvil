@@ -297,6 +297,31 @@ pub fn decoratedNameBuf(buf: []u8, user: *User) ?[]const u8 {
 	return std.fmt.bufPrint(buf, "[{s}]\n{s}", .{all[active].display, user.name}) catch null;
 }
 
+// --- ASHFRAME CUSTOM (nametag hardening) ---
+/// Strips control bytes (<0x20) except the intentional `\n` title separator,
+/// so a hostile title/display string can never smuggle layout-breaking bytes
+/// into above-head nametags (vanilla crash class). Writes into `buf` (callers
+/// size it >= input) and returns the used slice.
+pub fn sanitizeNametag(buf: []u8, input: []const u8) []const u8 {
+	var len: usize = 0;
+	for (input) |c| {
+		if (c < 0x20 and c != '\n') continue;
+		if (len >= buf.len) break; // never overflow; input-sized bufs never hit this
+		buf[len] = c;
+		len += 1;
+	}
+	return buf[0..len];
+}
+
+test "nametag sanitize keeps newline, drops other controls" {
+	var buf: [64]u8 = undefined;
+	try std.testing.expectEqualStrings("[Trader]\nBob", sanitizeNametag(&buf, "[Trader]\nBob"));
+	try std.testing.expectEqualStrings("[Trader]\nBob", sanitizeNametag(&buf, "[Trader]\nBob\x07\x1b"));
+	try std.testing.expectEqualStrings("AB", sanitizeNametag(&buf, "A\x00B\r"));
+	try std.testing.expectEqualStrings("", sanitizeNametag(&buf, "\x01\x02"));
+}
+// --- ASHFRAME CUSTOM (nametag hardening) ---
+
 /// Appends the player's admin prefix (red, stands out) and/or lowest season
 /// badge (quieter grey brackets) for use in the chat line. Gameplay titles
 /// show above the head only, never in chat; season badges show here only.

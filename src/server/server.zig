@@ -1485,10 +1485,21 @@ fn putEntityName(entityZon: main.ZonElement, user: *User) void {
 	if (!main.settings.launchConfig.titlesInNametag) return;
 	var nameBuf: [256]u8 = undefined;
 	const decorated = titles.decoratedNameBuf(&nameBuf, user) orelse return;
-	if (!std.unicode.utf8ValidateSlice(decorated)) {
-		std.log.err("[ashframe] invalid UTF-8 in entity name for {s}: {any}", .{ user.name, decorated });
+	// --- ASHFRAME CUSTOM (nametag hardening): strip smuggled control bytes
+	// (keeps the intentional title `\n`). A hit here logs loudly so a new
+	// bad-byte source announces itself instead of crashing a client. ---
+	var cleanBuf: [256]u8 = undefined;
+	const clean = titles.sanitizeNametag(&cleanBuf, decorated);
+	if (clean.len != decorated.len) {
+		std.log.warn("[ashframe] stripped control bytes from entity name for {s}", .{user.name});
 	}
-	entityZon.put("name", decorated);
+	if (!std.unicode.utf8ValidateSlice(clean)) {
+		std.log.err("[ashframe] invalid UTF-8 in entity name for {s}: {any}", .{ user.name, clean });
+	}
+	// --- ASHFRAME CUSTOM (use-after-scope fix): put() borrows the slice, but
+	// `clean` dies with this frame while callers serialize after return.
+	// putOwnedString dupes into the zon (freed by the callers' deinit). ---
+	entityZon.putOwnedString("name", clean);
 }
 
 /// Re-sends this player's entity to everyone else so a changed title is reflected
