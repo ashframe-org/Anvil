@@ -1977,16 +1977,16 @@ pub const Connection = struct { // MARK: Connection
 		// code sent a chat/normal protocol before the handshake completed.
 		const handshake = self.handShakeState.raw;
 		if (handshake != .complete and protocolIndex != protocols.handShake.id and protocolIndex != protocols.reload.id) {
-			std.log.warn("[ashframe] Connection.send: dropping protocol {d} before handshake completes (state={s})", .{protocolIndex, @tagName(handshake)});
+			std.log.debug("[ashframe] Connection.send: dropping protocol {d} before handshake completes (state={s})", .{protocolIndex, @tagName(handshake)});
 			return;
 		}
 		if (handshake == .complete and protocolIndex == protocols.handShake.id) {
-			std.log.warn("[ashframe] Connection.send: dropping handshake protocol after completion", .{});
+			std.log.debug("[ashframe] Connection.send: dropping handshake protocol after completion", .{});
 			return;
 		}
 		// Never send on a connection that's already been torn down.
 		if (self.connectionState.load(.monotonic) == .disconnected) {
-			std.log.info("[ashframe] Connection.send skipped: conn={x} is disconnected (proto {d})", .{@intFromPtr(self), protocolIndex});
+			std.log.debug("[ashframe] Connection.send skipped: conn={x} is disconnected (proto {d})", .{@intFromPtr(self), protocolIndex});
 			return;
 		}
 		_ = protocols.bytesSent[protocolIndex].fetchAdd(data.len, .monotonic);
