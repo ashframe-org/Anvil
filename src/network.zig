@@ -1349,15 +1349,70 @@ pub const Connection = struct { // MARK: Connection
 		// path that fragments instead of dropping (DF ineffective) can
 		// never ratchet into the 64K zone. Generous enough for jumbo LANs.
 		const maxProbeSize: u16 = 8192;
+		/// Most probes in flight (unanswered, awaiting confirmation).
+		const maxProbesInFlight: u8 = 3;
+		/// Consecutive double-loss events before the estimate backs off.
+		const mtUResetLossStreak: u16 = 4;
+		/// How far to back off per loss streak: a small step, not to the floor.
+		const mtUBackoffStep: u16 = 200;
+		/// Cooldown after a loss-driven backoff before searching again.
+		const mtuBackoffCooldown: i64 = 10*1000*ms;
 
 		var nextIndex: SequenceIndex = 0;
+
+		// --- ASHFRAME CUSTOM (MTU probing: RTT-aware timing, high-ping fix) ---
+		/// A probe's wait before it is declared lost must exceed the path
+		/// RTT, or a high-latency player's (perfectly good) probe is judged
+		/// failed prematurely and the search never converges. Scale the base
+		/// timer by the connection's RTT estimate: max(15s, 4*RTT).
+		fn probeTimeout(rttEstimateUs: f32) i64 {
+			const rtt: i64 = @intFromFloat(@max(rttEstimateUs, 0));
+			return @max(probeTimer, 4*rtt);
+		}
+		/// Re-search cooldown: the RFC default 10 min. Kept generous to avoid
+		/// churn (a lossy path keeps its working estimate instead of
+		/// re-searching constantly).
+		fn raiseCooldown() i64 {
+			return 10*60*1000*ms;
+		}
+		/// Next size to probe for, given the current estimate and ceiling.
+		/// Steps by `step`, clamped just below the ceiling.
+		fn nextProbeSizeFor(estimate: u16, step: u16) u16 {
+			return @min(estimate +| step, maxProbeSize - 50);
+		}
+		// --- ASHFRAME CUSTOM (MTU probing: RTT-aware timing) ---
+
+		test "probe timeout scales with RTT" {
+			// rttEstimate is in microseconds; probeTimer = 15*1000*ms.
+			// Low ping: floor at the RFC-recommended 15s.
+			try std.testing.expectEqual(probeTimer, probeTimeout(20*1000));
+			try std.testing.expectEqual(probeTimer, probeTimeout(0));
+			// High ping (500ms): 4*RTT = 2_000_000us < 15s, still floored.
+			try std.testing.expectEqual(probeTimer, probeTimeout(500*1000));
+			// Extreme ping (5s): 4*RTT = 20_000_000us > 15s, scaled up.
+			try std.testing.expectEqual(@as(i64, 4*5*1000*1000), probeTimeout(5*1000*1000));
+		}
+
+		test "probe size steps toward the ceiling and stops below it" {
+			try std.testing.expectEqual(@as(u16, 598), nextProbeSizeFor(548, 50));
+			try std.testing.expectEqual(@as(u16, 648), nextProbeSizeFor(598, 50));
+			// Never exceeds maxProbeSize - 50.
+			try std.testing.expectEqual(maxProbeSize - 50, nextProbeSizeFor(8180, 50));
+			try std.testing.expectEqual(maxProbeSize - 50, nextProbeSizeFor(8191, 9999));
+		}
 
 		/// In this state we are actively searching with probes for a higher mtu
 		searching: struct {
 			probedSize: u16 = undefined,
-			probeSequenceIndex: ?SequenceIndex = null,
+			/// In-flight probes awaiting confirmation. We keep several open
+			/// at once so a confirmation for any of them confirms the size,
+			/// and space them below the ceiling to reach it faster.
+			probeIndices: [maxProbesInFlight]SequenceIndex = @splat(0),
+			probeInFlightCount: u8 = 0,
 			probeTimeStamp: i64 = undefined,
 			probeCount: u8 = 0,
+			/// Candidate size this round is probing for.
+			probeStep: u16 = 50,
 		},
 		/// in this state we had a succesfull search and now use until the pmtuRaiseTimer is over the current mtu estimate
 		searchFinished: struct {
@@ -1384,15 +1439,27 @@ pub const Connection = struct { // MARK: Connection
 						}};
 						return false;
 					}
-					if (state.probeSequenceIndex == null) return true;
-					if (time - state.probeTimeStamp > probeTimer) {
-						state.probeSequenceIndex = null;
+					// Keep a few probes in flight, spaced below the ceiling,
+					// so we reach the real path MTU quickly instead of one
+					// +50 step per RTT.
+					if (state.probeInFlightCount < maxProbesInFlight) return true;
+					if (time - state.probeTimeStamp > probeTimeout(conn.rttEstimate)) {
+						// All in-flight probes unconfirmed: count as one
+						// failed round.
+						state.probeInFlightCount = 0;
 						state.probeCount += 1;
 
 						if (state.probeCount >= maxProbes) {
-							self.* = .{.searchFinished = .{
-								.timestamp = time,
-							}};
+							self.* = .{
+								.searchFinished = .{
+									.timestamp = time,
+									// --- ASHFRAME CUSTOM (MTU probing: loss-adaptive
+									// cooldown): after a failed search, wait a
+									// bounded time, then retry. Avoids permanent
+									// give-up on transient loss.
+									.pmtuRaiseTimer = raiseCooldown(),
+								},
+							};
 						}
 					}
 					return false;
@@ -1410,18 +1477,32 @@ pub const Connection = struct { // MARK: Connection
 
 		fn nextProbeSize(self: *ProbingState, conn: *Connection) u16 {
 			std.debug.assert(self.* == .searching);
-			self.searching.probedSize = @min(conn.mtuEstimate, maxProbeSize - 50) + 50;
+			// Probe one step below the ceiling while there is headroom, so
+			// loss at the very top still leaves a usable estimate.
+			self.searching.probedSize = nextProbeSizeFor(conn.mtuEstimate, self.searching.probeStep);
 			return self.searching.probedSize;
 		}
 
+		/// A confirmation arrived for `sequenceIndex`. If it matches any
+		/// in-flight probe of this round, the probed size is confirmed.
 		fn receiveConfirmationAndGetTimestamp(self: *ProbingState, conn: *Connection, sequenceIndex: SequenceIndex) ?SendBuffer.ReceiveConfirmationResult {
 			if (self.* != .searching) return null;
-			if (self.searching.probeSequenceIndex != sequenceIndex) return null;
+			var matched = false;
+			for (self.searching.probeIndices[0..self.searching.probeInFlightCount]) |idx| {
+				if (idx == sequenceIndex) {
+					matched = true;
+					break;
+				}
+			}
+			if (!matched) return null;
 
 			self.searching.probeCount = 0;
-			self.searching.probeSequenceIndex = null;
-			conn.mtuEstimate = self.searching.probedSize;
-			std.log.info("[mtu] estimate raised to {d}B", .{conn.mtuEstimate});
+			self.searching.probeInFlightCount = 0;
+			conn.lossStreak = 0; // a good confirmation clears the loss signal
+			if (self.searching.probedSize > conn.mtuEstimate) {
+				conn.mtuEstimate = self.searching.probedSize;
+				std.log.info("[mtu] estimate raised to {d}B", .{conn.mtuEstimate});
+			}
 			return .{
 				.timestamp = networkTimestamp(),
 				.packetLen = sequenceIndex,
@@ -1431,10 +1512,15 @@ pub const Connection = struct { // MARK: Connection
 
 		fn setProbeInfo(self: *ProbingState, time: i64) SequenceIndex {
 			std.debug.assert(self.* == .searching);
-			self.searching.probeSequenceIndex = nextIndex;
+			const idx = nextIndex;
 			nextIndex += 1;
+			const slot = self.searching.probeInFlightCount;
+			if (slot < maxProbesInFlight) {
+				self.searching.probeIndices[slot] = idx;
+				self.searching.probeInFlightCount += 1;
+			}
 			self.searching.probeTimeStamp = time;
-			return self.searching.probeSequenceIndex.?;
+			return idx;
 		}
 	};
 
@@ -1761,6 +1847,11 @@ pub const Connection = struct { // MARK: Connection
 	mtuEstimate: u16 = minMtu,
 	// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port) ---
 	mtuProbingState: ProbingState,
+	/// Consecutive double-loss events since the last good confirmation.
+	/// Used by the loss-adaptive reset to distinguish "our probes are too
+	/// big for this path" from "this path just drops packets sometimes".
+	lossStreak: u16 = 0,
+	// --- ASHFRAME CUSTOM (MTU probing) ---
 
 	bandwidthEstimateInBytesPerRtt: f32 = minMtu,
 	slowStart: bool = true,
@@ -1886,7 +1977,7 @@ pub const Connection = struct { // MARK: Connection
 		// code sent a chat/normal protocol before the handshake completed.
 		const handshake = self.handShakeState.raw;
 		if (handshake != .complete and protocolIndex != protocols.handShake.id and protocolIndex != protocols.reload.id) {
-			std.log.warn("[ashframe] Connection.send: dropping protocol {d} before handshake completes (state={s})", .{ protocolIndex, @tagName(handshake) });
+			std.log.warn("[ashframe] Connection.send: dropping protocol {d} before handshake completes (state={s})", .{protocolIndex, @tagName(handshake)});
 			return;
 		}
 		if (handshake == .complete and protocolIndex == protocols.handShake.id) {
@@ -1895,7 +1986,7 @@ pub const Connection = struct { // MARK: Connection
 		}
 		// Never send on a connection that's already been torn down.
 		if (self.connectionState.load(.monotonic) == .disconnected) {
-			std.log.info("[ashframe] Connection.send skipped: conn={x} is disconnected (proto {d})", .{ @intFromPtr(self), protocolIndex });
+			std.log.info("[ashframe] Connection.send skipped: conn={x} is disconnected (proto {d})", .{@intFromPtr(self), protocolIndex});
 			return;
 		}
 		_ = protocols.bytesSent[protocolIndex].fetchAdd(data.len, .monotonic);
@@ -1931,18 +2022,35 @@ pub const Connection = struct { // MARK: Connection
 			self.rttEstimate *= 1.5;
 			self.bandwidthEstimateInBytesPerRtt /= 2;
 			self.bandwidthEstimateInBytesPerRtt = @max(self.bandwidthEstimateInBytesPerRtt, minMtu);
-			// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port):
-			// path may have changed; drop back to minimum and re-search
-			// after a short cooldown. Ours takes priority otherwise: the
-			// PR-3191 ramp and backpressure above are untouched. ---
-			// until the handShake is done, we don't probe so it also doesn't need to be reset
-			if (self.handShakeState.load(.acquire) == .complete) {
-				self.mtuEstimate = minMtu;
-				self.mtuProbingState = .{.searchFinished = .{
-					.timestamp = networkTimestamp(),
-					.pmtuRaiseTimer = 5*1000*ms,
-				}};
+			// --- ASHFRAME CUSTOM (MTU probing: loss-adaptive reset) ---
+			// Do NOT slam the MTU estimate to the floor on generic double
+			// loss: lossy-but-usable links (25%+ packet loss is common on
+			// bad wifi/mobile) would then thrash between 548B and the real
+			// size forever. Only reset when the loss is plausibly caused by
+			// our own size — i.e. the loss rate is high AND we are currently
+			// probing above the floor (so a too-big probe is a candidate
+			// cause). Otherwise keep the working estimate and let the normal
+			// search back off via maxProbes. Also only back off a fraction
+			// of the way rather than all the way to minMtu.
+			if (self.handShakeState.load(.acquire) == .complete and self.mtuEstimate > minMtu) {
+				self.lossStreak +|= 1;
+				// A burst of consecutive double-losses is the signal that
+				// the current size is likely too large for the path.
+				if (self.lossStreak >= ProbingState.mtUResetLossStreak) {
+					self.lossStreak = 0;
+					// Back off one step rather than all the way down, so a
+					// single bad burst doesn't destroy a good estimate.
+					self.mtuEstimate = @max(minMtu, self.mtuEstimate -| ProbingState.mtUBackoffStep);
+					self.mtuProbingState = .{.searchFinished = .{
+						.timestamp = networkTimestamp(),
+						.pmtuRaiseTimer = ProbingState.mtuBackoffCooldown,
+					}};
+					std.log.info("[mtu] backing off to {d}B after loss streak", .{self.mtuEstimate});
+				}
+			} else {
+				self.lossStreak = 0;
 			}
+			// --- ASHFRAME CUSTOM (MTU probing: loss-adaptive reset) ---
 		}
 	}
 
