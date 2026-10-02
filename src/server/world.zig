@@ -1272,6 +1272,16 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 				}
 				// --- ASHFRAME CUSTOM (Auto AFK) ---
 
+				// --- ASHFRAME CUSTOM (Hunger) ---
+				// Energy == calories (the vanilla energy bar). Drain over time,
+				// faster while moving; well-fed regenerates health; empty drains
+				// health down to a 1 HP floor. Server-side only: the vanilla
+				// client renders the synced energy bar.
+				if (main.settings.launchConfig.hungerSystem and user.gamemode.load(.monotonic) == .survival) {
+					server.hunger.tick(user, @floatCast(deltaTime), @floatCast(speedSq));
+				}
+				// --- ASHFRAME CUSTOM (Hunger) ---
+
 				// --- ASHFRAME CUSTOM (Title tracking) ---
 				if (prof.is_afk) prof.afk_time += deltaTime;
 				{

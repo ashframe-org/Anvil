@@ -39,6 +39,7 @@ pub const veterans = @import("veterans.zig");
 pub const waypoints = @import("waypoints.zig");
 pub const chatfilter = @import("chatfilter.zig");
 pub const shrines = @import("shrines.zig");
+pub const hunger = @import("hunger.zig");
 pub const shops = @import("shops.zig");
 pub const anticheat = @import("anticheat.zig");
 pub const report = @import("report.zig");

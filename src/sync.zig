@@ -112,16 +112,16 @@ pub const client = struct { // MARK: client
 			var reader = BinaryReader.init(sync.data);
 
 			switch (sync.typ) {
-			.confirmation => {
-				if (tempData.popOrNull()) |_cmd| {
-					var cmd = _cmd;
-					// Never trap the client on a command replay it can't apply
-					// (e.g. a container that unloaded mid-open): skip it like
-					// any other invalid sync instead of disconnecting.
-					cmd.do(main.globalAllocator, .client, null, main.game.Player.gamemode.raw) catch |err| {
-						std.log.warn("Ignoring un-appliable confirmation sync: {s}", .{@errorName(err)});
-						continue;
-					};
+				.confirmation => {
+					if (tempData.popOrNull()) |_cmd| {
+						var cmd = _cmd;
+						// Never trap the client on a command replay it can't apply
+						// (e.g. a container that unloaded mid-open): skip it like
+						// any other invalid sync instead of disconnecting.
+						cmd.do(main.globalAllocator, .client, null, main.game.Player.gamemode.raw) catch |err| {
+							std.log.warn("Ignoring un-appliable confirmation sync: {s}", .{@errorName(err)});
+							continue;
+						};
 						cmd.finalize(main.globalAllocator, .client, &reader) catch |err| {
 							std.log.warn("Ignoring invalid confirmation sync: {s}", .{@errorName(err)});
 							continue;
@@ -281,6 +281,17 @@ pub fn addHealth(health: f32, cause: main.game.DamageType, side: Side, entity: m
 	}
 }
 
+// --- ASHFRAME CUSTOM (Hunger): public energy delta. Hunger is driven purely
+// server-side (there is no client-side prediction for it), so this only queues
+// the authoritative server operation. The vanilla client already renders the
+// energy bar from the synced value. ---
+pub fn addEnergy(energy: f32, side: Side, entity: main.entity.Entity) void {
+	threadContext.assertCorrectContext(side);
+	std.debug.assert(side == .server);
+	server.executeCommand(.{.addEnergy = .{.target = entity, .energy = energy}}, null);
+}
+// --- ASHFRAME CUSTOM (Hunger) ---
+
 pub fn setGamemode(user: ?*main.server.User, gamemode: Gamemode) void {
 	if (user == null) {
 		client.setGamemode(gamemode);
@@ -309,6 +320,10 @@ pub const Command = struct { // MARK: Command
 		updateBlock = 9,
 		addHealth = 10,
 		chatCommand = 12,
+		// --- ASHFRAME CUSTOM (Hunger): server-only payload (never sent by
+		// clients; new value 19, no existing value renumbered). ---
+		addEnergy = 19,
+		// --- ASHFRAME CUSTOM (Hunger) ---
 	};
 	pub const Payload = union(PayloadType) {
 		open: Open,
@@ -330,6 +345,9 @@ pub const Command = struct { // MARK: Command
 		updateBlock: UpdateBlock,
 		addHealth: AddHealth,
 		chatCommand: ChatCommand,
+		// --- ASHFRAME CUSTOM (Hunger) ---
+		addEnergy: AddEnergy,
+		// --- ASHFRAME CUSTOM (Hunger) ---
 	};
 
 	const BaseOperationType = enum(u8) {
@@ -884,6 +902,26 @@ pub const Command = struct { // MARK: Command
 
 					if (info.target.?.player().health <= 0) {
 						info.target.?.player().health = info.target.?.player().maxHealth;
+						// --- ASHFRAME CUSTOM (Hunger): a fresh start after death
+						// (matches the client reset in game.Player.kill). Set the
+						// value directly and queue the sync op, rather than
+						// re-entering executeCommand from inside this operation. ---
+						{
+							const prof = info.target.?.player();
+							const energyDelta = prof.maxEnergy - prof.energy;
+							prof.energy = prof.maxEnergy;
+							prof.hungerDebt = 0;
+							prof.hungerRegenTimer = 0;
+							prof.hungerStarveTimer = 0;
+							prof.hungerWarnTimer = 0;
+							if (energyDelta != 0) {
+								self.syncOperations.append(allocator, .{.energy = .{
+									.target = info.target.?,
+									.energy = energyDelta,
+								}});
+							}
+						}
+						// --- ASHFRAME CUSTOM (Hunger) ---
 						info.cause.sendMessage(info.target.?.name);
 
 						// --- ASHFRAME CUSTOM (/back on death) ---
@@ -1776,109 +1814,109 @@ pub const Command = struct { // MARK: Command
 			var shouldDropSourceBlockOnSuccess: bool = true;
 			const costOfChange = if (ctx.gamemode != .creative) self.oldBlock.canBeChangedInto(self.newBlock, stack.*, &shouldDropSourceBlockOnSuccess) else .yes;
 
-		// Check if we can change it:
-		if (!switch (costOfChange) {
-			.no => false,
-			.yes => true,
-			.yes_costsDurability => stack.item == .proceduralItem,
-			.yes_costsItems => |amount| stack.amount >= amount,
-		}) {
+			// Check if we can change it:
+			if (!switch (costOfChange) {
+				.no => false,
+				.yes => true,
+				.yes_costsDurability => stack.item == .proceduralItem,
+				.yes_costsItems => |amount| stack.amount >= amount,
+			}) {
+				if (ctx.side == .server) {
+					// Inform the client of the actual block:
+					var writer = BinaryWriter.init(main.stackAllocator);
+					defer writer.deinit();
+
+					const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
+					main.network.protocols.blockUpdate.send(ctx.user.?.conn, &.{.init(pos, actualBlock, writer.data.items)});
+				}
+				return;
+			}
+
 			if (ctx.side == .server) {
-				// Inform the client of the actual block:
-				var writer = BinaryWriter.init(main.stackAllocator);
-				defer writer.deinit();
+				// --- ASHFRAME CUSTOM (Land claims) ---
+				if (ctx.user) |u| {
+					if (self.newBlock.typ != self.oldBlock.typ and !main.server.claims.canBuild(u, pos[0], pos[2], pos[1])) {
+						main.server.claims.notifyDenied(u, pos[0], pos[1]);
+						var writer = BinaryWriter.init(main.stackAllocator);
+						defer writer.deinit();
 
-				const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
-				main.network.protocols.blockUpdate.send(ctx.user.?.conn, &.{.init(pos, actualBlock, writer.data.items)});
-			}
-			return;
-		}
-
-		if (ctx.side == .server) {
-			// --- ASHFRAME CUSTOM (Land claims) ---
-			if (ctx.user) |u| {
-				if (self.newBlock.typ != self.oldBlock.typ and !main.server.claims.canBuild(u, pos[0], pos[2], pos[1])) {
-					main.server.claims.notifyDenied(u, pos[0], pos[1]);
-					var writer = BinaryWriter.init(main.stackAllocator);
-					defer writer.deinit();
-
-					const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
-					main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
-					// Must fail, not silently succeed: success sends a
-					// confirmation that finalizes the client's optimistic item
-					// consume, eating the held item for a reverted block.
-					// Failure makes the client restore it.
-					return error.serverFailure;
+						const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
+						main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
+						// Must fail, not silently succeed: success sends a
+						// confirmation that finalizes the client's optimistic item
+						// consume, eating the held item for a reverted block.
+						// Failure makes the client restore it.
+						return error.serverFailure;
+					}
 				}
-			}
-			// --- ASHFRAME CUSTOM (Land claims) ---
+				// --- ASHFRAME CUSTOM (Land claims) ---
 
-			// --- ASHFRAME CUSTOM (Anticheat: reach) ---
-			if (ctx.user) |u| {
-				if (self.newBlock.typ != self.oldBlock.typ and !main.server.anticheat.checkReach(u, .{pos[0], pos[1], pos[2]})) {
-					var writer = BinaryWriter.init(main.stackAllocator);
-					defer writer.deinit();
-					const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
-					main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
-					// Fail (restores the held item client-side), don't
-					// silently confirm. See the claims branch above.
-					return error.serverFailure;
-				}
-			}
-			// --- ASHFRAME CUSTOM (Anticheat) ---
-
-			// --- ASHFRAME CUSTOM (Waypoints: owner-only break) ---
-			if (ctx.user) |u| {
-				const waypointTyp = main.blocks.getTypeById("ashframe:waypoint");
-				if (waypointTyp != 0 and self.oldBlock.typ == waypointTyp and self.newBlock.typ != waypointTyp) {
-					if (!main.server.waypoints.canBreak(u, pos[0], pos[1], pos[2])) {
+				// --- ASHFRAME CUSTOM (Anticheat: reach) ---
+				if (ctx.user) |u| {
+					if (self.newBlock.typ != self.oldBlock.typ and !main.server.anticheat.checkReach(u, .{pos[0], pos[1], pos[2]})) {
 						var writer = BinaryWriter.init(main.stackAllocator);
 						defer writer.deinit();
 						const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
 						main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
+						// Fail (restores the held item client-side), don't
+						// silently confirm. See the claims branch above.
+						return error.serverFailure;
+					}
+				}
+				// --- ASHFRAME CUSTOM (Anticheat) ---
+
+				// --- ASHFRAME CUSTOM (Waypoints: owner-only break) ---
+				if (ctx.user) |u| {
+					const waypointTyp = main.blocks.getTypeById("ashframe:waypoint");
+					if (waypointTyp != 0 and self.oldBlock.typ == waypointTyp and self.newBlock.typ != waypointTyp) {
+						if (!main.server.waypoints.canBreak(u, pos[0], pos[1], pos[2])) {
+							var writer = BinaryWriter.init(main.stackAllocator);
+							defer writer.deinit();
+							const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
+							main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
+							// Fail so the held item is restored, not consumed.
+							return error.serverFailure;
+						}
+					}
+				}
+				// --- ASHFRAME CUSTOM (Waypoints) ---
+
+				// --- ASHFRAME CUSTOM (Shrines: return core is unbreakable) ---
+				if (ctx.user) |u| {
+					const retTyp = main.blocks.getTypeById("ashframe:return_core");
+					if (retTyp != 0 and self.oldBlock.typ == retTyp and self.newBlock.typ != retTyp) {
+						var writer = BinaryWriter.init(main.stackAllocator);
+						defer writer.deinit();
+						const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
+						main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
+						u.sendMessage("#e6312cThe return core can't be broken.", .{});
 						// Fail so the held item is restored, not consumed.
 						return error.serverFailure;
 					}
 				}
-			}
-			// --- ASHFRAME CUSTOM (Waypoints) ---
+				// --- ASHFRAME CUSTOM (Shrines) ---
 
-			// --- ASHFRAME CUSTOM (Shrines: return core is unbreakable) ---
-			if (ctx.user) |u| {
-				const retTyp = main.blocks.getTypeById("ashframe:return_core");
-				if (retTyp != 0 and self.oldBlock.typ == retTyp and self.newBlock.typ != retTyp) {
-					var writer = BinaryWriter.init(main.stackAllocator);
-					defer writer.deinit();
-					const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
-					main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
-					u.sendMessage("#e6312cThe return core can't be broken.", .{});
-					// Fail so the held item is restored, not consumed.
-					return error.serverFailure;
+				// --- ASHFRAME CUSTOM (Sign shops: locked to owner) ---
+				if (ctx.user) |u| {
+					if (self.newBlock.typ != self.oldBlock.typ and !main.server.shops.canBreak(u, .{pos[0], pos[1], pos[2]}, self.oldBlock)) {
+						var writer = BinaryWriter.init(main.stackAllocator);
+						defer writer.deinit();
+						const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
+						main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
+						u.sendMessage("#e6312cThis is someone else's shop.", .{});
+						// Fail so the held item is restored, not consumed.
+						return error.serverFailure;
+					}
 				}
-			}
-			// --- ASHFRAME CUSTOM (Shrines) ---
-
-			// --- ASHFRAME CUSTOM (Sign shops: locked to owner) ---
-			if (ctx.user) |u| {
-				if (self.newBlock.typ != self.oldBlock.typ and !main.server.shops.canBreak(u, .{pos[0], pos[1], pos[2]}, self.oldBlock)) {
-					var writer = BinaryWriter.init(main.stackAllocator);
-					defer writer.deinit();
-					const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
-					main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
-					u.sendMessage("#e6312cThis is someone else's shop.", .{});
-					// Fail so the held item is restored, not consumed.
-					return error.serverFailure;
+				if (self.newBlock.typ != self.oldBlock.typ) {
+					main.server.shops.onBroken(.{pos[0], pos[1], pos[2]}, self.oldBlock);
 				}
+				// --- ASHFRAME CUSTOM (Sign shops) ---
+				// NOTE: break-time (instant-break) enforcement was tried here and
+				// REMOVED: legitimate god-tier pickaxes break fast enough to trip
+				// any timing model, and lag batches false-positive. Break speed is
+				// not policed; cost/claims/reach above still are.
 			}
-			if (self.newBlock.typ != self.oldBlock.typ) {
-				main.server.shops.onBroken(.{pos[0], pos[1], pos[2]}, self.oldBlock);
-			}
-			// --- ASHFRAME CUSTOM (Sign shops) ---
-			// NOTE: break-time (instant-break) enforcement was tried here and
-			// REMOVED: legitimate god-tier pickaxes break fast enough to trip
-			// any timing model, and lag batches false-positive. Break speed is
-			// not policed; cost/claims/reach above still are.
-		}
 
 			if (ctx.side == .server) {
 				if (main.server.world.?.cmpxchgBlock(pos[0], pos[1], pos[2], self.oldBlock, self.newBlock) != null) {
@@ -2068,6 +2106,39 @@ pub const Command = struct { // MARK: Command
 			return result;
 		}
 	};
+
+	// --- ASHFRAME CUSTOM (Hunger): server-only energy delta. Mirrors AddHealth
+	// but is never serialized (hunger is authoritative server-side). ---
+	const AddEnergy = struct { // MARK: AddEnergy
+		target: main.entity.Entity,
+		energy: f32,
+
+		pub fn run(self: AddEnergy, ctx: Context) error{serverFailure}!void {
+			if (ctx.side != .server) return error.serverFailure;
+			var target: ?*main.server.User = null;
+			const userList = main.server.getUserList(main.stackAllocator);
+			defer main.stackAllocator.free(userList);
+			for (userList) |user| {
+				if (user.id == self.target) {
+					target = user;
+					break;
+				}
+			}
+			if (target == null) return error.serverFailure;
+
+			ctx.execute(.{.addEnergy = .{
+				.target = target,
+				.energy = self.energy,
+				.previous = target.?.player().energy,
+			}});
+		}
+
+		fn serialize(_: AddEnergy, _: *BinaryWriter) void {}
+		fn deserialize(_: *BinaryReader, _: Side, _: ?*main.server.User) !AddEnergy {
+			return error.Invalid;
+		}
+	};
+	// --- ASHFRAME CUSTOM (Hunger) ---
 
 	const ChatCommand = struct { // MARK: ChatCommand
 		message: []const u8,

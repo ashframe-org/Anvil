@@ -256,6 +256,12 @@ pub const launchConfig = struct {
 	/// see the probe channel. Kill-switch: false disables all probing.
 	pub var mtuProbing: bool = true;
 	// --- ASHFRAME CUSTOM (MTU probing) ---
+	// --- ASHFRAME CUSTOM (Hunger) ---
+	/// Hunger uses the vanilla energy bar (energy == calories). Drains over
+	/// time, food (`/eat`) restores it, and starving drains health to 1 HP.
+	/// Purely server-side: the vanilla client already renders the energy bar.
+	pub var hungerSystem: bool = true;
+	// --- ASHFRAME CUSTOM (Hunger) ---
 	// --- ASHFRAME CUSTOM (Bisect toggles) ---
 
 	pub var vulkanTestingMode: bool = false;
@@ -284,6 +290,7 @@ pub const launchConfig = struct {
 		ashframePackSkip = zon.get(bool, "ashframePackSkip") orelse ashframePackSkip;
 		mtuProbing = zon.get(bool, "mtuProbing") orelse mtuProbing;
 		// --- ASHFRAME CUSTOM (UX-6) ---
+		hungerSystem = zon.get(bool, "hungerSystem") orelse hungerSystem;
 		// --- ASHFRAME CUSTOM (UX-3: tunable worker count) ---
 		// `cpuThreads` existed but was never loaded, so the pool was always
 		// `nproc-1`. Expose it so the server can oversubscribe for blocking

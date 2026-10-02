@@ -21,98 +21,106 @@ prefix: ?[]const u8 = null,
 tpa_request_from: ?usize = null,
 still_time: f32 = 0.0,
 is_afk: bool = false,
-	home_pos: ?Vec3d = null,
-	homeUnlocked: bool = false,
-	back_pos: ?Vec3d = null,
-	waypointPending: ?Vec3d = null,
-	playtime: u64 = 0,
-	login_time: i64 = 0,
+home_pos: ?Vec3d = null,
+homeUnlocked: bool = false,
+back_pos: ?Vec3d = null,
+waypointPending: ?Vec3d = null,
+playtime: u64 = 0,
+login_time: i64 = 0,
 
-	// --- ASHFRAME CUSTOM (Progress: skills) ---
-	blocksMined: u64 = 0,
-	blocksPlaced: u64 = 0,
-	loginStreak: u16 = 0,
-	streakMonth: u32 = 0,
-	lastRewardDay: i64 = -1,
-	veteranLimboNotified: bool = false,
-	strikes: u8 = 0,
-	// Set by the chat filter on the network thread; the server thread performs
-	// the actual message/disconnect/save so teardown never runs off-thread.
-	pendingBan: bool = false,
-	// Set by the anticheat on the network thread after sustained speed
-	// violations; the server thread kicks so teardown never runs off-thread.
-	pendingKick: bool = false,
-	// Session-only (not persisted): movement-violation count + window start
-	// for the repeat-speeder auto-kick, plus a consecutive-over-threshold
-	// streak so a single laggy sample never pages the operators.
-	moveViolations: u32 = 0,
-	moveViolationWindowStart: i64 = 0,
-	moveViolationStreak: u8 = 0,
-	// Session-only (not persisted): creative-op abuse count + window start
-	// for the auto-kick below (sustained instant-break, creative-only packets
-	// from a survival account). Same pattern as the movement counters.
-	creativeOpViolations: u32 = 0,
-	creativeOpWindowStart: i64 = 0,
-	seenBiomes: ?[]const u8 = null,
-	// Session-only (not persisted):
-	last_biome_check: i64 = 0,
-	// --- ASHFRAME CUSTOM (Progress) ---
+// --- ASHFRAME CUSTOM (Progress: skills) ---
+blocksMined: u64 = 0,
+blocksPlaced: u64 = 0,
+loginStreak: u16 = 0,
+streakMonth: u32 = 0,
+lastRewardDay: i64 = -1,
+veteranLimboNotified: bool = false,
+strikes: u8 = 0,
+// Set by the chat filter on the network thread; the server thread performs
+// the actual message/disconnect/save so teardown never runs off-thread.
+pendingBan: bool = false,
+// Set by the anticheat on the network thread after sustained speed
+// violations; the server thread kicks so teardown never runs off-thread.
+pendingKick: bool = false,
+// Session-only (not persisted): movement-violation count + window start
+// for the repeat-speeder auto-kick, plus a consecutive-over-threshold
+// streak so a single laggy sample never pages the operators.
+moveViolations: u32 = 0,
+moveViolationWindowStart: i64 = 0,
+moveViolationStreak: u8 = 0,
+// Session-only (not persisted): creative-op abuse count + window start
+// for the auto-kick below (sustained instant-break, creative-only packets
+// from a survival account). Same pattern as the movement counters.
+creativeOpViolations: u32 = 0,
+creativeOpWindowStart: i64 = 0,
+seenBiomes: ?[]const u8 = null,
+// Session-only (not persisted):
+last_biome_check: i64 = 0,
+// --- ASHFRAME CUSTOM (Progress) ---
 
-	// --- ASHFRAME CUSTOM (Titles) ---
-	titles: u64 = 0,
-	active_title: ?u8 = null,
-	messages_sent: u32 = 0,
-	afk_time: f32 = 0,
-	days_played: u16 = 0,
-	last_played_day: i64 = -1,
-	distance_travelled: f64 = 0,
-	min_y: ?f32 = null,
-	apples_eaten: u32 = 0,
-	shopTrades: u32 = 0,
-	// Session-only (not persisted):
-	last_sky_check: i64 = 0,
-	last_track_pos: ?Vec3d = null,
-	// --- ASHFRAME CUSTOM (Titles) ---
+// --- ASHFRAME CUSTOM (Titles) ---
+titles: u64 = 0,
+active_title: ?u8 = null,
+messages_sent: u32 = 0,
+afk_time: f32 = 0,
+days_played: u16 = 0,
+last_played_day: i64 = -1,
+distance_travelled: f64 = 0,
+min_y: ?f32 = null,
+apples_eaten: u32 = 0,
+shopTrades: u32 = 0,
+// Session-only (not persisted):
+last_sky_check: i64 = 0,
+last_track_pos: ?Vec3d = null,
+// --- ASHFRAME CUSTOM (Titles) ---
 
-	// --- ASHFRAME CUSTOM (Teleport costs) ---
-	// Session-only (not persisted):
-	tpa_request_time: i64 = 0,
-	showClaims: bool = false,
-	lastClaimDraw: i64 = 0,
-	waypointCooldownUntil: i64 = 0,
-	/// Monotonic second of the last "teleport ready in Ns" notice shown while
-	/// standing on a waypoint/sky anchor during its cooldown. Throttles the
-	/// notice (a jump looks like stepping off and back on, which re-fired the
-	/// old once-per-stand latch every hop). Session-only, never persisted.
-	anchorCooldownNotifiedAt: i64 = 0,
-	/// Stand-on tracking for the waypoint anti-troll delay: the anchor the
-	/// player has been continuously above, and when the stand started
-	/// (monotonic seconds). Reset whenever they leave it. Session-only.
-	anchorStandPos: ?[3]i32 = null,
-	anchorStandSince: i64 = 0,
-	/// Async destination preload: held simulation-chunk refs while waiting for
-	/// the far anchor's neighborhood to load, plus which destination they were
-	/// requested for and when the wait started (monotonic seconds, for the
-	/// load timeout). The landing search touches the anchor chunk and its
-	/// neighbors (up to 8 distinct 32-chunks: ±1 block horizontally, +0..+3
-	/// vertically); holding a ref per chunk keeps each load task alive (see
-	/// ChunkLoadTask culling). Released on arrival, stand break, destination
-	/// change, or deinit. Session-only.
-	anchorLoadChunks: [8]?*main.server.SimulationChunk = .{null} ** 8,
-	anchorLoadCount: usize = 0,
-	anchorLoadPos: [3]i32 = .{ 0, 0, 0 },
-	anchorLoadSince: i64 = 0,
-	/// Re-fire suppression: the destination anchor just teleported to. While
-	/// the player stands on it, the waypoint won't fire again — they must step
-	/// off (clears this) and step back on. Session-only.
-	anchorSuppressPos: ?[3]i32 = null,
-	// --- ASHFRAME CUSTOM (Teleport costs) ---
-	// --- ASHFRAME CUSTOM (Fields) ---
+// --- ASHFRAME CUSTOM (Teleport costs) ---
+// Session-only (not persisted):
+tpa_request_time: i64 = 0,
+showClaims: bool = false,
+lastClaimDraw: i64 = 0,
+waypointCooldownUntil: i64 = 0,
+/// Monotonic second of the last "teleport ready in Ns" notice shown while
+/// standing on a waypoint/sky anchor during its cooldown. Throttles the
+/// notice (a jump looks like stepping off and back on, which re-fired the
+/// old once-per-stand latch every hop). Session-only, never persisted.
+anchorCooldownNotifiedAt: i64 = 0,
+/// Stand-on tracking for the waypoint anti-troll delay: the anchor the
+/// player has been continuously above, and when the stand started
+/// (monotonic seconds). Reset whenever they leave it. Session-only.
+anchorStandPos: ?[3]i32 = null,
+anchorStandSince: i64 = 0,
+/// Async destination preload: held simulation-chunk refs while waiting for
+/// the far anchor's neighborhood to load, plus which destination they were
+/// requested for and when the wait started (monotonic seconds, for the
+/// load timeout). The landing search touches the anchor chunk and its
+/// neighbors (up to 8 distinct 32-chunks: ±1 block horizontally, +0..+3
+/// vertically); holding a ref per chunk keeps each load task alive (see
+/// ChunkLoadTask culling). Released on arrival, stand break, destination
+/// change, or deinit. Session-only.
+anchorLoadChunks: [8]?*main.server.SimulationChunk = .{null} ** 8,
+anchorLoadCount: usize = 0,
+anchorLoadPos: [3]i32 = .{0, 0, 0},
+anchorLoadSince: i64 = 0,
+/// Re-fire suppression: the destination anchor just teleported to. While
+/// the player stands on it, the waypoint won't fire again — they must step
+/// off (clears this) and step back on. Session-only.
+anchorSuppressPos: ?[3]i32 = null,
+// --- ASHFRAME CUSTOM (Teleport costs) ---
+// --- ASHFRAME CUSTOM (Fields) ---
 
 health: f32 = 8,
 maxHealth: f32 = 8,
 energy: f32 = 8,
 maxEnergy: f32 = 8,
+// --- ASHFRAME CUSTOM (Hunger): fractional drain accumulator + health-regen
+// timer. In-memory only (not saved): both are small and re-accumulate within
+// seconds of rejoining, and persisting them adds save-format churn. ---
+hungerDebt: f32 = 0,
+hungerRegenTimer: f32 = 0,
+hungerStarveTimer: f32 = 0,
+hungerWarnTimer: f32 = 0,
+// --- ASHFRAME CUSTOM (Hunger) ---
 name: ?[]const u8 = null,
 id: main.entity.Entity = .noValue,
 
@@ -207,10 +215,10 @@ pub fn clone(self: *@This(), copy: *@This()) void {
 	copy.* = self.*;
 	copy.name = if (self.name) |name| main.globalAllocator.dupe(u8, name) else null;
 
-// --- ASHFRAME CUSTOM (clone) ---
-copy.prefix = if (self.prefix) |p| main.globalAllocator.dupe(u8, p) else null;
-copy.seenBiomes = if (self.seenBiomes) |s| main.globalAllocator.dupe(u8, s) else null;
-// --- ASHFRAME CUSTOM (clone) ---
+	// --- ASHFRAME CUSTOM (clone) ---
+	copy.prefix = if (self.prefix) |p| main.globalAllocator.dupe(u8, p) else null;
+	copy.seenBiomes = if (self.seenBiomes) |s| main.globalAllocator.dupe(u8, s) else null;
+	// --- ASHFRAME CUSTOM (clone) ---
 
 	copy.id = originalID;
 }
