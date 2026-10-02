@@ -66,11 +66,11 @@ Sensitive actions additionally gate behind `/ashframe/admin/*` (never granted by
 
 ## Ops / Config (`launchConfig.zon`)
 
-`serverOwnerKey` (admin bootstrap), `cpuThreads` (chunk gen workers), `ashframeMetrics` (default on), `ashframePackSkip` (default on), `serverAuthoritativeCharges` (default on), `titlesInNametag` (default on, vanilla clients force off), `customParticles` / `customStructures` (default on), `antiXray` (default off), `dynamicRenderDistance` (default off).
+`serverOwnerKey` (admin bootstrap), `cpuThreads` (chunk gen workers), `ashframeMetrics` (default on), `ashframePackSkip` (default on), `serverAuthoritativeCharges` (default on), `titlesInNametag` (default on, vanilla clients force off), `customParticles` / `customStructures` (default on), `antiXray` (default off), `dynamicRenderDistance` (default off), `mtuProbing` (default on).
 
 ## Notes
 
 - Chat/signs/names filtered (3 strikes = ban). Mild profanity allowed.
 - Anticheat logs to `saves/<world>/ashframe_anticheat.zig.zon`. Test suite: `tools/run_anticheat_tests.sh`.
 - Metrics snapshot: `saves/<world>/ashframe_metrics.json`. Dashboard: `tools/ashframe_monitor.py`.
-- Networking is vanilla-compatible: interest-gated broadcasts (same packets, fewer recipients), asset-pack skip, slow-channel chunks/lightmaps.
+- Networking is vanilla-compatible: interest-gated broadcasts (same packets, fewer recipients), block updates batched per tick per player, asset-pack skip, slow-channel chunks/lightmaps, and MTU path discovery (RFC 8899) for capable Argon clients.
