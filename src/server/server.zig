@@ -1553,6 +1553,9 @@ pub fn connectInternal(user: *User) void {
 		}
 		titles.check(user);
 		veterans.grant(user);
+		// Service/bot accounts must never show a veteran season badge; clear any
+		// bit persisted from before the exclusion existed.
+		_ = veterans.clearExcludedSeasonTitles(user);
 	}
 	// --- ASHFRAME CUSTOM (Titles: distinct-days tracking) ---
 }

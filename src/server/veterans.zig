@@ -181,7 +181,7 @@ pub fn load() void {
 			if (season < 8) mask |= @as(u8, 1) << @intCast(season);
 		}
 		if (mask == 0) continue;
-		names.append(.{ .name = main.globalAllocator.dupe(u8, name), .seasons = mask });
+		names.append(.{.name = main.globalAllocator.dupe(u8, name), .seasons = mask});
 	}
 	for (zon.getChild("keys").toSlice()) |entry| {
 		const key = entry.get([]const u8, "key") orelse continue;
@@ -191,7 +191,7 @@ pub fn load() void {
 			if (season < 8) mask |= @as(u8, 1) << @intCast(season);
 		}
 		if (mask == 0) continue;
-		keys.append(.{ .key = main.globalAllocator.dupe(u8, key), .seasons = mask });
+		keys.append(.{.key = main.globalAllocator.dupe(u8, key), .seasons = mask});
 	}
 	for (zon.getChild("limbo").toSlice()) |entry| {
 		const name = entry.as([]const u8) orelse continue;
@@ -201,7 +201,7 @@ pub fn load() void {
 }
 
 fn seasonTitleIndex(season: u3) ?usize {
-	const ids = [_][]const u8{ "s0", "s1", "s2", "s3" };
+	const ids = [_][]const u8{"s0", "s1", "s2", "s3"};
 	return main.server.titles.indexOf(ids[season]);
 }
 
@@ -209,7 +209,7 @@ fn seasonTitleIndex(season: u3) ?usize {
 /// names can coincidentally collide with roster entries (the Discord relay
 /// joined as "Discord", which matched a real veteran's row). Compared against
 /// the cleaned name, case-insensitively.
-const excludedNames = [_][]const u8{ "discord", "cctv" };
+const excludedNames = [_][]const u8{"discord", "cctv"};
 
 fn isExcluded(cleanedName: []const u8) bool {
 	for (excludedNames) |ex| {
@@ -268,6 +268,35 @@ pub fn grant(user: *User) void {
 		return;
 	}
 	_ = applyToUser(user, mask, false);
+}
+
+/// Self-heal for service/bot accounts: `grant` only SKIPS adding badges to
+/// excluded names, so a badge persisted in the account's player file before the
+/// exclusion existed (e.g. the Discord relay's "Discord" collided with a real
+/// veteran's roster row) would keep showing forever. Clear every season bonus
+/// (S0-S3) bit for excluded accounts on join so they can never display one.
+/// Returns true if anything was cleared.
+pub fn clearExcludedSeasonTitles(user: *User) bool {
+	var cleaned = main.ListManaged(u8).init(main.stackAllocator);
+	defer cleaned.deinit();
+	appendCleaned(&cleaned, user.name);
+	if (!isExcluded(cleaned.items)) return false;
+
+	const prof = user.player();
+	var changed = false;
+	var s: u3 = 0;
+	while (s < 4) : (s += 1) {
+		const idx = seasonTitleIndex(s) orelse continue;
+		const bit = @as(u64, 1) << @intCast(idx);
+		if (prof.titles & bit != 0) {
+			prof.titles &= ~bit;
+			changed = true;
+		}
+	}
+	if (changed) {
+		std.log.info("[ashframe] cleared season badges from service account {s}", .{user.name});
+	}
+	return changed;
 }
 
 /// Grants the seasons in `mask` to `user` now (if online), and tells them.
@@ -378,10 +407,10 @@ fn clearOfflineTitleBit(cleanedName: []const u8, bit: u64) void {
 		if (titles & bit == 0) continue;
 		entity.put("titles", titles & ~bit);
 		playerDir.writeZon(file.name, zon) catch |err| {
-			std.log.err("Could not clear season badge in player file {s}: {s}", .{ file.name, @errorName(err) });
+			std.log.err("Could not clear season badge in player file {s}: {s}", .{file.name, @errorName(err)});
 			continue;
 		};
-		std.log.info("Cleared season badge in player file {s} ({s})", .{ file.name, storedName });
+		std.log.info("Cleared season badge in player file {s} ({s})", .{file.name, storedName});
 	}
 }
 
@@ -553,12 +582,12 @@ test "veteran season bits iterate the full mask without overflow" {
 	// terminated and trapped on 7+1, crashing every save() (all /veteran
 	// mutations). Masks touching bit 7 prove full-range termination.
 	const cases = [_]struct { mask: u8, want: []const u8 }{
-		.{ .mask = 0x00, .want = &.{} },
-		.{ .mask = 0x01, .want = &.{0} },
-		.{ .mask = 0b00001111, .want = &.{ 0, 1, 2, 3 } },
-		.{ .mask = 0x80, .want = &.{7} },
-		.{ .mask = 0xFF, .want = &.{ 0, 1, 2, 3, 4, 5, 6, 7 } },
-		.{ .mask = 0b10100101, .want = &.{ 0, 2, 5, 7 } },
+		.{.mask = 0x00, .want = &.{}},
+		.{.mask = 0x01, .want = &.{0}},
+		.{.mask = 0b00001111, .want = &.{0, 1, 2, 3}},
+		.{.mask = 0x80, .want = &.{7}},
+		.{.mask = 0xFF, .want = &.{0, 1, 2, 3, 4, 5, 6, 7}},
+		.{.mask = 0b10100101, .want = &.{0, 2, 5, 7}},
 	};
 	for (cases) |c| {
 		var arr = main.ZonElement.initArray(main.stackAllocator);
