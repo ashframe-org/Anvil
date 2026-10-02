@@ -1462,6 +1462,16 @@ pub fn connectInternal(user: *User) void {
 	// --- ASHFRAME CUSTOM (Ban check) ---
 
 	user.initPlayer();
+	// --- ASHFRAME CUSTOM (Dynamic render distance) ---
+	// Arm the view ramp on JOIN, not just on command teleports. The join spawn
+	// is delivered via sendServerPlayerData (not sendTPCoordinates), so without
+	// this the ramp was never active on join: viewCapped stayed false, no
+	// requests were throttled, and a low-RD client flooded the server with its
+	// far-LOD cloud, which the LOD-biased priority then drained ahead of the
+	// near field (slow RD5 joins). Arming here makes the first ~3 s serve the
+	// near field first at every render distance.
+	user.beginTeleportViewRamp();
+	// --- ASHFRAME CUSTOM (Dynamic render distance) ---
 	// Cache staff status on the server thread: the movement check runs on the
 	// network thread, where `hasPermission` may not be called.
 	user.anticheatStaff = main.entity.components.@"cubyz:permissions".server.hasPermission(user.id, report.permissionPath);

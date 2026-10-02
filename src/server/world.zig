@@ -221,7 +221,35 @@ pub const ChunkManager = struct { // MARK: ChunkManager
 			switch (self.source) {
 				.player => |player| {
 					const user = server.getUserByIndex(player) orelse return 0;
-					return self.pos.getPriority(user.player().pos);
+					// --- ASHFRAME CUSTOM (Dynamic render distance) ---
+					// Same formula as ChunkPosition.getPriority, except the flat
+					// per-LOD bonus is withheld for chunks outside the player's
+					// *effective* (throttled) render distance. This keeps the
+					// coarse far cloud from outranking the near field the
+					// client's reveal gate measures during a join/teleport ramp.
+					// When no throttle is active `eff == renderDistance`, so the
+					// ordering is identical to stock.
+					const effRaw = user.dynamicRenderDistance.load(.monotonic);
+					const eff: u16 = if (effRaw == 0) user.renderDistance else effRaw;
+					const pos = self.pos;
+					const playerPos = user.player().pos;
+					const base = pos.getPriority(playerPos); // stock formula
+					// Subtract the flat LOD bonus when outside the effective view
+					// radius, so the coarse far cloud can't outrank the near field.
+					const viewRadius: f64 = @as(f64, @floatFromInt(eff))*@as(f64, @floatFromInt(chunk.chunkSize))*@as(f64, @floatFromInt(pos.voxelSize));
+					const center = Vec3d{
+						@as(f64, @floatFromInt(pos.wx)) + @as(f64, @floatFromInt(pos.voxelSize*chunk.chunkSize/2)),
+						@as(f64, @floatFromInt(pos.wy)) + @as(f64, @floatFromInt(pos.voxelSize*chunk.chunkSize/2)),
+						@as(f64, @floatFromInt(pos.wz)) + @as(f64, @floatFromInt(pos.voxelSize*chunk.chunkSize/2)),
+					};
+					const dx = center[0] - playerPos[0];
+					const dy = center[1] - playerPos[1];
+					const dz = center[2] - playerPos[2];
+					if (dx*dx + dy*dy + dz*dz > viewRadius*viewRadius) {
+						return base - 2*@as(f32, @floatFromInt(std.math.log2_int(u31, pos.voxelSize)*chunk.chunkSize*chunk.chunkSize));
+					}
+					return base;
+					// --- ASHFRAME CUSTOM (Dynamic render distance) ---
 				},
 				else => return std.math.floatMax(f32),
 			}
