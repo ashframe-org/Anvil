@@ -160,11 +160,11 @@ fn dynamicRenderDistanceFor(user: *User) u16 {
 fn ensureDefaultCommandPermissions(id: main.entity.Entity) void {
 	const perms = main.entity.components.@"cubyz:permissions".server;
 	const defaults = [_][]const u8{
-		"/command/home", "/command/sethome", "/command/delhome", "/command/homes",
-		"/command/waypoint", "/command/tpa", "/command/tpaccept", "/command/back",
-		"/command/players", "/command/playtime", "/command/stats", "/command/afk", "/command/tpdeny",
-		"/command/msg", "/command/alliance", "/command/claim", "/command/eat",
-		"/command/titles", "/command/title", "/command/shop",
+		"/command/home",     "/command/sethome",  "/command/delhome",  "/command/homes",
+		"/command/waypoint", "/command/tpa",      "/command/tpaccept", "/command/back",
+		"/command/players",  "/command/playtime", "/command/stats",    "/command/afk",
+		"/command/tpdeny",   "/command/msg",      "/command/alliance", "/command/claim",
+		"/command/eat",      "/command/titles",   "/command/title",    "/command/shop",
 		// Note: "/command/veteran" is granted so admins can invoke it, but the
 		// command additionally gates on "/ashframe/admin/veteran" (NOT granted
 		// by default), same pattern as /prefix and /spawn.
@@ -172,7 +172,7 @@ fn ensureDefaultCommandPermissions(id: main.entity.Entity) void {
 		// Note: "/command/spawn" is granted so players can teleport to spawn,
 		// but spawn.zig gates setting spawn points / moving world spawn behind
 		// "/ashframe/admin/spawn", which is NOT granted by default.
-		"/command/spawn",
+		 "/command/spawn",
 	};
 	for (defaults) |path| perms.addPermission(id, .white, path);
 	// "/command/prefix" is NOT a default: prefix.zig gates everything behind
@@ -241,6 +241,15 @@ pub const User = struct { // MARK: User
 	/// players who walk into range. 8 KB inline, no alloc/deinit needed.
 	seenDrops: std.bit_set.ArrayBitSet(usize, main.itemdrop.ItemDropManager.maxCapacity) = .empty,
 	// --- ASHFRAME CUSTOM (drop interest gating) ---
+	// --- ASHFRAME CUSTOM (batched block updates) ---
+	// Block updates accumulated during one server tick, flushed as a single
+	// `blockUpdate` packet at tick end. Vanilla clients already accept
+	// multiple updates per packet (the receiver loops), so this is
+	// wire-compatible. `batchIndex` dedups by position: editing the same
+	// block twice in a tick keeps only the final state.
+	blockUpdateBatch: main.ListManaged(main.renderer.mesh_storage.BlockUpdate) = undefined,
+	batchIndex: std.AutoHashMap(Vec3i, usize) = undefined,
+	// --- ASHFRAME CUSTOM (batched block updates) ---
 
 	inventoryClientToServerIdMap: std.AutoHashMap(InventoryId, InventoryId) = undefined,
 	inventory: ?InventoryId = null,
@@ -403,9 +412,7 @@ pub const User = struct { // MARK: User
 	/// distance, so throttling can only delay delivery, never drop a request.
 	pub fn keepRadiusBlocks(self: *User, voxelSize: u31) f64 {
 		const margin = self.latencyKeepMarginChunks();
-		return (@as(f64, @floatFromInt(self.renderDistance)) + margin) *
-			@as(f64, @floatFromInt(main.chunk.chunkSize)) *
-			@as(f64, @floatFromInt(voxelSize));
+		return (@as(f64, @floatFromInt(self.renderDistance)) + margin) * @as(f64, @floatFromInt(main.chunk.chunkSize)) * @as(f64, @floatFromInt(voxelSize));
 	}
 
 	// --- ASHFRAME CUSTOM (interest gating) ---
@@ -426,6 +433,38 @@ pub const User = struct { // MARK: User
 		return dx*dx + dy*dy + dz*dz <= r*r;
 	}
 	// --- ASHFRAME CUSTOM (interest gating) ---
+
+	// --- ASHFRAME CUSTOM (batched block updates) ---
+	/// Queue a block update for this player, to be sent as part of one
+	/// batched packet at tick end. `data` is duplicated (owned by the batch).
+	/// At most one update per position is kept (last write wins).
+	pub fn enqueueBlockUpdate(self: *User, pos: Vec3i, newBlock: main.blocks.Block, data: []const u8) void {
+		const gop = self.batchIndex.getOrPut(pos) catch unreachable;
+		if (gop.found_existing) {
+			const i = gop.value_ptr.*;
+			self.blockUpdateBatch.items[i].newBlock = newBlock;
+			main.globalAllocator.free(self.blockUpdateBatch.items[i].blockEntityData);
+			self.blockUpdateBatch.items[i].blockEntityData = main.globalAllocator.dupe(u8, data);
+			return;
+		}
+		gop.value_ptr.* = self.blockUpdateBatch.items.len;
+		self.blockUpdateBatch.append(.{
+			.pos = pos,
+			.newBlock = newBlock,
+			.blockEntityData = main.globalAllocator.dupe(u8, data),
+		});
+	}
+
+	/// Send the accumulated block updates as one packet and clear the batch.
+	pub fn flushBlockUpdates(self: *User) void {
+		if (self.blockUpdateBatch.items.len != 0 and self.conn.connectionState.load(.monotonic) == .connected) {
+			main.network.protocols.blockUpdate.send(self.conn, self.blockUpdateBatch.items);
+		}
+		for (self.blockUpdateBatch.items) |u| main.globalAllocator.free(u.blockEntityData);
+		self.blockUpdateBatch.clearRetainingCapacity();
+		self.batchIndex.clearRetainingCapacity();
+	}
+	// --- ASHFRAME CUSTOM (batched block updates) ---
 
 	/// Effective distance forced by an active teleport ramp: starts at
 	/// `teleportRampFromRD` and expands linearly to the client's distance.
@@ -528,7 +567,7 @@ pub const User = struct { // MARK: User
 		const prev = self.lastSentEffectiveRD;
 		self.lastSentEffectiveRD = eff;
 		if (!changed) {
-			self.sendMessage("#8a8a8a[perf] view #cfcfcf{d}/{d} chunks #8a8a8a· speed #cfcfcf{d:.0} b/s", .{ eff, self.renderDistance, speed });
+			self.sendMessage("#8a8a8a[perf] view #cfcfcf{d}/{d} chunks #8a8a8a· speed #cfcfcf{d:.0} b/s", .{eff, self.renderDistance, speed});
 		} else if (capped) {
 			self.sendMessage("#8a8a8a[perf] view #cfcfcf{d} #8a8a8a→ #e6312c{d} chunks #cfcfcf(speed {d:.0} b/s; full ≤{d:.0}, min {d})", .{
 				self.renderDistance, eff, speed, dynamicRdFullSpeed, dynamicRdMinChunks,
@@ -538,7 +577,7 @@ pub const User = struct { // MARK: User
 				prev, eff, speed,
 			});
 		}
-		std.log.info("[perf] {s} view {d} (client {d}), speed {d:.0} b/s", .{ self.name, eff, self.renderDistance, speed });
+		std.log.info("[perf] {s} view {d} (client {d}), speed {d:.0} b/s", .{self.name, eff, self.renderDistance, speed});
 	}
 
 	fn requeueDeferred(self: *User, chunks: []const main.chunk.ChunkPosition) void {
@@ -549,7 +588,6 @@ pub const User = struct { // MARK: User
 			self.deferredChunks.append(main.globalAllocator, req);
 		}
 	}
-
 
 	pub fn init(manager: *ConnectionManager, ipPort: []const u8) !*User {
 		const self = main.globalAllocator.create(User);
@@ -633,6 +671,12 @@ pub const User = struct { // MARK: User
 		self.inventoryCommands.deinit(main.globalAllocator);
 		self.deferredChunks.deinit(main.globalAllocator);
 
+		// --- ASHFRAME CUSTOM (batched block updates) ---
+		for (self.blockUpdateBatch.items) |u| main.globalAllocator.free(u.blockEntityData);
+		self.blockUpdateBatch.deinit();
+		self.batchIndex.deinit();
+		// --- ASHFRAME CUSTOM (batched block updates) ---
+
 		self.jobQueue.deinit();
 	}
 
@@ -700,6 +744,11 @@ pub const User = struct { // MARK: User
 	pub fn initPlayer(self: *User) void {
 		self.id = @enumFromInt(freeId);
 		freeId += 1;
+
+		// --- ASHFRAME CUSTOM (batched block updates) ---
+		self.blockUpdateBatch = main.ListManaged(main.renderer.mesh_storage.BlockUpdate).init(main.globalAllocator);
+		self.batchIndex = std.AutoHashMap(Vec3i, usize).init(main.globalAllocator.allocator);
+		// --- ASHFRAME CUSTOM (batched block updates) ---
 
 		world.?.loadPlayer(self) catch {
 			std.log.err("Error while loading player data of {s}. Discarding data.", .{self.name});
@@ -942,7 +991,7 @@ pub const User = struct { // MARK: User
 		// The held list is empty in normal play; only run the (O(n)) pass every
 		// other tick so it can't dominate the tick during throttling.
 		self.deferredTick +%= 1;
-		if (self.deferredTick % 2 == 0) self.processDeferredChunks();
+		if (self.deferredTick%2 == 0) self.processDeferredChunks();
 		self.maybeSendViewDebugMessage();
 		// --- ASHFRAME CUSTOM (Dynamic render distance) ---
 
@@ -1063,7 +1112,7 @@ fn reportTickWork(workMs: f32) void {
 	const now = main.server.anticheat.nowMilliseconds();
 	if (now - lagWarnLastMs < 10_000) return;
 	lagWarnLastMs = now;
-	std.log.warn("Server tick over budget: this tick {d:.1} ms, {d}/{d} recent ticks over {d:.0} ms", .{ workMs, overCount, lagWindow.len, tickBudgetMs });
+	std.log.warn("Server tick over budget: this tick {d:.1} ms, {d}/{d} recent ticks over {d:.0} ms", .{workMs, overCount, lagWindow.len, tickBudgetMs});
 }
 
 var thread: ?std.Thread = null;
@@ -1090,8 +1139,6 @@ fn init(name: []const u8, singlePlayerPort: ?u16, mode: ServerWorld.Mode) void {
 		@panic("Can't generate world.");
 	};
 
-
-
 	connectionManager.@"continue"() catch |err| {
 		std.log.err("Couldn't create thread: {s}", .{@errorName(err)});
 		@panic("Could not open Server.");
@@ -1106,7 +1153,6 @@ fn init(name: []const u8, singlePlayerPort: ?u16, mode: ServerWorld.Mode) void {
 		user.isLocal = true;
 	}
 }
-
 
 fn deinit() void {
 	main.threadPool.pause();
@@ -1176,7 +1222,6 @@ fn update() void { // MARK: update()
 		user.update();
 	}
 
-
 	// --- ASHFRAME CUSTOM (Deferred chat-filter bans) ---
 	// Applied here so the message/save/disconnect happen on the server thread.
 	for (userList) |user| {
@@ -1238,6 +1283,14 @@ fn update() void { // MARK: update()
 			main.network.protocols.genericUpdate.sendBiome(user.conn, biomeId);
 		}
 	}
+
+	// --- ASHFRAME CUSTOM (batched block updates): one packet per player per
+	// tick instead of one per edit. Flushed after all tick work (world chunk
+	// ticks + user updates) so every queued update is included. ---
+	for (userList) |user| {
+		user.flushBlockUpdates();
+	}
+	// --- ASHFRAME CUSTOM (batched block updates) ---
 
 	while (userDeinitList.popFront()) |user| {
 		user.deferredPauseAndDeinit();
@@ -1500,7 +1553,7 @@ fn putEntityName(entityZon: main.ZonElement, user: *User) void {
 		std.log.warn("[ashframe] stripped control bytes from entity name for {s}", .{user.name});
 	}
 	if (!std.unicode.utf8ValidateSlice(clean)) {
-		std.log.err("[ashframe] invalid UTF-8 in entity name for {s}: {any}", .{ user.name, clean });
+		std.log.err("[ashframe] invalid UTF-8 in entity name for {s}: {any}", .{user.name, clean});
 	}
 	// --- ASHFRAME CUSTOM (use-after-scope fix): put() borrows the slice, but
 	// `clean` dies with this frame while callers serialize after return.
@@ -1553,7 +1606,7 @@ pub fn messageFrom(msg: []const u8, source: *User) void { // MARK: message
 	// version with the @name highlighted gold, and is EXCLUDED from the
 	// normal broadcast so they don't see the line twice. ---
 	const mentioned = findMentionedUser(source, clean_msg);
-	const line = main.stackAllocator.print("{s}§#ffffff{s}§#8a8a8a > §#ffffff{s}", .{ tag.items, source.name, clean_msg });
+	const line = main.stackAllocator.print("{s}§#ffffff{s}§#8a8a8a > §#ffffff{s}", .{tag.items, source.name, clean_msg});
 	defer main.stackAllocator.free(line);
 	sendRawMessageExcept(line, mentioned);
 	if (mentioned) |m| {
@@ -1678,7 +1731,7 @@ fn sendRawMessageExcept(msg: []const u8, except: ?*User) void {
 		if (except != null and user == except.?) continue;
 		const state = user.conn.connectionState.load(.monotonic);
 		if (state != .connected) {
-			std.log.warn("[ashframe] sendRawMessage: skipping {s} user={x} conn={x} (state {s})", .{ user.name, @intFromPtr(user), @intFromPtr(user.conn), @tagName(state) });
+			std.log.warn("[ashframe] sendRawMessage: skipping {s} user={x} conn={x} (state {s})", .{user.name, @intFromPtr(user), @intFromPtr(user.conn), @tagName(state)});
 			continue;
 		}
 		user.sendRawMessage(msg);

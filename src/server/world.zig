@@ -229,24 +229,24 @@ pub const ChunkManager = struct { // MARK: ChunkManager
 
 		pub fn isStillNeeded(self: *ChunkLoadTask) bool {
 			switch (self.source) { // Remove the task if it's far enough away from the player:
-			.player => |player| {
-				const user = server.getUserByIndex(player) orelse return false;
-				// --- ASHFRAME CUSTOM (Dynamic render distance) ---
-				// Keep the task if it is within keep-radius of EITHER the player's
-				// fresh server-side position OR the position the client last asked
-				// from. The server position lags a teleport (it is interpolated from
-				// the client's frames), and the client's request base freezes if the
-				// client stalls. Using only one of them dropped tasks the client was
-				// still waiting for - permanent holes, which the client never retries.
-				// Throttling may delay delivery, never lose it.
-				const keepRadius = user.keepRadiusBlocks(self.pos.voxelSize);
-				const keepRadiusSquare = keepRadius*keepRadius;
-				const liveDistSquare = @as(f64, @floatFromInt(self.pos.getMinDistanceSquared(user.livePosBlock())));
-				if (liveDistSquare <= keepRadiusSquare) return true;
-				const clientDistSquare = @as(f64, @floatFromInt(self.pos.getMinDistanceSquared(user.clientUpdatePos)));
-				return clientDistSquare <= keepRadiusSquare;
-				// --- ASHFRAME CUSTOM (Dynamic render distance) ---
-			},
+				.player => |player| {
+					const user = server.getUserByIndex(player) orelse return false;
+					// --- ASHFRAME CUSTOM (Dynamic render distance) ---
+					// Keep the task if it is within keep-radius of EITHER the player's
+					// fresh server-side position OR the position the client last asked
+					// from. The server position lags a teleport (it is interpolated from
+					// the client's frames), and the client's request base freezes if the
+					// client stalls. Using only one of them dropped tasks the client was
+					// still waiting for - permanent holes, which the client never retries.
+					// Throttling may delay delivery, never lose it.
+					const keepRadius = user.keepRadiusBlocks(self.pos.voxelSize);
+					const keepRadiusSquare = keepRadius*keepRadius;
+					const liveDistSquare = @as(f64, @floatFromInt(self.pos.getMinDistanceSquared(user.livePosBlock())));
+					if (liveDistSquare <= keepRadiusSquare) return true;
+					const clientDistSquare = @as(f64, @floatFromInt(self.pos.getMinDistanceSquared(user.clientUpdatePos)));
+					return clientDistSquare <= keepRadiusSquare;
+					// --- ASHFRAME CUSTOM (Dynamic render distance) ---
+				},
 				.simulationChunk => |ch| if (ch.refCount.load(.monotonic) == 2) return false,
 			}
 			return true;
@@ -459,7 +459,6 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 	/// the next update, where no chunk lock is held.
 	pendingOreReveal: main.List(Vec3i) = .empty,
 	// --- ASHFRAME CUSTOM (Anti-xray) ---
-
 
 	blockPalette: *main.assets.Palette = undefined,
 	itemPalette: *main.assets.Palette = undefined,
@@ -1174,9 +1173,9 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 				const nb = self.getBlock(nx, ny, nz) orelse continue;
 				if (!main.blocks.isOre(nb)) continue;
 				for (userList) |user| {
-					// --- ASHFRAME CUSTOM (interest gating) ---
+					// --- ASHFRAME CUSTOM (interest gating + batching) ---
 					if (!user.canSeeBlock(nx, ny, nz)) continue;
-					main.network.protocols.blockUpdate.send(user.conn, &.{.{.pos = .{nx, ny, nz}, .newBlock = nb, .blockEntityData = &.{}}});
+					user.enqueueBlockUpdate(.{nx, ny, nz}, nb, &.{});
 				}
 			}
 		}
@@ -1455,10 +1454,11 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 				defer main.stackAllocator.free(userList);
 
 				for (userList) |user| {
-					// --- ASHFRAME CUSTOM (interest gating): only players that
-					// hold the chunk need this. Far clients drop it anyway. ---
+					// --- ASHFRAME CUSTOM (interest gating + batching): only
+					// players that hold the chunk need this; queue for the
+					// tick-end batch instead of immediate send. ---
 					if (!user.canSeeBlock(wx +% neighbor.relX(), wy +% neighbor.relY(), wz +% neighbor.relZ())) continue;
-					main.network.protocols.blockUpdate.send(user.conn, &.{.{.pos = .{wx +% neighbor.relX(), wy +% neighbor.relY(), wz +% neighbor.relZ()}, .newBlock = neighborBlock, .blockEntityData = &.{}}});
+					user.enqueueBlockUpdate(.{wx +% neighbor.relX(), wy +% neighbor.relY(), wz +% neighbor.relZ()}, neighborBlock, &.{});
 				}
 			}
 			if (newBlock.mode().dependsOnNeighbors) {
@@ -1481,10 +1481,10 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 		defer main.stackAllocator.free(userList);
 
 		for (userList) |user| {
-			// --- ASHFRAME CUSTOM (interest gating): only players that hold
-			// the chunk need this. Far clients drop it anyway. ---
+			// --- ASHFRAME CUSTOM (interest gating + batching): only players
+			// that hold the chunk need this; queue for the tick-end batch. ---
 			if (!user.canSeeBlock(wx, wy, wz)) continue;
-			main.network.protocols.blockUpdate.send(user.conn, &.{.{.pos = .{wx, wy, wz}, .newBlock = newBlock, .blockEntityData = &.{}}});
+			user.enqueueBlockUpdate(.{wx, wy, wz}, newBlock, &.{});
 		}
 		// --- ASHFRAME CUSTOM (Anti-xray): ores exposed by this change ---
 		if (main.settings.launchConfig.antiXray and newBlock.viewThrough() and self.pendingOreReveal.items.len < maxPendingOreReveal) {

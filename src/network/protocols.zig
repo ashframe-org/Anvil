@@ -209,7 +209,7 @@ pub const handShake = struct { // MARK: handShake
 					if (zon.get(i64, "ashframeClientVersion")) |v| {
 						if (v >= 0 and v <= std.math.maxInt(u16)) {
 							conn.user.?.ashframeClientVersion = @intCast(v);
-							std.log.info("User {s} is Argon v{d}", .{ name, v });
+							std.log.info("User {s} is Argon v{d}", .{name, v});
 						}
 					}
 					// --- ASHFRAME CUSTOM (capability handshake) ---
@@ -319,7 +319,7 @@ pub const handShake = struct { // MARK: handShake
 									main.server.connect(conn.user.?);
 									return;
 								} else {
-									std.log.debug("[ashframe] pack hash mismatch for {s}: announced={d} current={d}, sending full pack", .{ conn.user.?.name, announced, sentHash });
+									std.log.debug("[ashframe] pack hash mismatch for {s}: announced={d} current={d}, sending full pack", .{conn.user.?.name, announced, sentHash});
 								}
 							}
 						}
@@ -1244,17 +1244,17 @@ pub const blockEntityUpdate = struct { // MARK: blockEntityUpdate
 				}
 			}
 			// --- ASHFRAME CUSTOM (Sign shops) ---
-		// --- ASHFRAME CUSTOM (Anticheat: reach) ---
-		if (conn.user) |user| {
-			if (!main.server.anticheat.checkReach(user, .{pos[0], pos[1], pos[2]})) return;
-		}
-		// --- ASHFRAME CUSTOM (Anticheat) ---
-		// NOTE: a claim check (canBuild) was tried here and REMOVED: this
-		// handler runs on the network thread, and canBuild reaches
-		// permissions.hasPermission, which asserts server-thread-only and
-		// aborts the whole server on any sign edit. Sign text is therefore
-		// NOT claim-gated (shop offer text is still protected above).
-		if (main.server.chatfilter.findBad(reader.remaining) != null) {
+			// --- ASHFRAME CUSTOM (Anticheat: reach) ---
+			if (conn.user) |user| {
+				if (!main.server.anticheat.checkReach(user, .{pos[0], pos[1], pos[2]})) return;
+			}
+			// --- ASHFRAME CUSTOM (Anticheat) ---
+			// NOTE: a claim check (canBuild) was tried here and REMOVED: this
+			// handler runs on the network thread, and canBuild reaches
+			// permissions.hasPermission, which asserts server-thread-only and
+			// aborts the whole server on any sign edit. Sign text is therefore
+			// NOT claim-gated (shop offer text is still protected above).
+			if (main.server.chatfilter.findBad(reader.remaining) != null) {
 				if (conn.user) |user| {
 					// The ban is completed on the server thread.
 					_ = main.server.chatfilter.strike(user);
@@ -1304,9 +1304,10 @@ pub const blockEntityUpdate = struct { // MARK: blockEntityUpdate
 		defer main.stackAllocator.free(users);
 
 		for (users) |user| {
-			// --- ASHFRAME CUSTOM (interest gating) ---
+			// --- ASHFRAME CUSTOM (interest gating + batching): queue the
+			// block-entity update (sign/shop etc.) for the tick-end batch. ---
 			if (!user.canSeeBlock(pos[0], pos[1], pos[2])) continue;
-			blockUpdate.send(user.conn, &.{.{.pos = pos, .newBlock = block, .blockEntityData = writer.data.items}});
+			user.enqueueBlockUpdate(pos, block, writer.data.items);
 		}
 	}
 
