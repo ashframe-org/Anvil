@@ -1843,6 +1843,15 @@ pub const Connection = struct { // MARK: Connection
 	lastRttSampleTime: i64,
 	nextPacketTimestamp: i64,
 	nextConfirmationTimestamp: i64,
+	// --- ASHFRAME CUSTOM (idle keepalive) ---
+	// Periodic server->client keepalive. The client (and the Discord relay's
+	// cubyz-node-client) declares "inactivity" after a few seconds with no
+	// inbound traffic. Stock relied on ambient packets; our interest-gating and
+	// batched updates made idle connections genuinely silent, so idle clients
+	// (bots, AFK players) were dropped. One small keepalive per interval fixes
+	// that for every client without changing any payload.
+	nextKeepAliveTimestamp: i64,
+	// --- ASHFRAME CUSTOM (idle keepalive) ---
 	queuedConfirmations: main.utils.CircularBufferQueue(ConfirmationData),
 	mtuEstimate: u16 = minMtu,
 	// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port) ---
@@ -1880,6 +1889,7 @@ pub const Connection = struct { // MARK: Connection
 			.lastConnectionTime = null,
 			.nextPacketTimestamp = networkTimestamp(),
 			.nextConfirmationTimestamp = networkTimestamp(),
+			.nextKeepAliveTimestamp = networkTimestamp(),
 			.lastRttSampleTime = networkTimestamp() -% 10_000*ms,
 			.queuedConfirmations = .init(main.globalAllocator, 1024),
 			.lossyChannel = .init(main.random.nextInt(SequenceIndex, &main.seed), 1*ms, .lossy),
@@ -2296,7 +2306,16 @@ pub const Connection = struct { // MARK: Connection
 				self.manager.send(writer.data.items, self.remoteAddress, null);
 				return;
 			},
-			.connected => {},
+			.connected => {
+				// --- ASHFRAME CUSTOM (idle keepalive): send a tiny keepalive
+				// every second while connected so idle clients never hit their
+				// inactivity timeout. Unreliable channel, no payload. ---
+				if (timestamp -% self.nextKeepAliveTimestamp >= 0) {
+					self.nextKeepAliveTimestamp = timestamp +% 1000*ms;
+					self.manager.send(&.{@intFromEnum(ChannelId.keepalive)}, self.remoteAddress, null);
+				}
+				// --- ASHFRAME CUSTOM (idle keepalive) ---
+			},
 			.disconnected, .paused => return,
 		}
 
