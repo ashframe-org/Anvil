@@ -412,7 +412,7 @@ pub const User = struct { // MARK: User
 	/// distance, so throttling can only delay delivery, never drop a request.
 	pub fn keepRadiusBlocks(self: *User, voxelSize: u31) f64 {
 		const margin = self.latencyKeepMarginChunks();
-		return (@as(f64, @floatFromInt(self.renderDistance)) + margin) * @as(f64, @floatFromInt(main.chunk.chunkSize)) * @as(f64, @floatFromInt(voxelSize));
+		return (@as(f64, @floatFromInt(self.renderDistance)) + margin)*@as(f64, @floatFromInt(main.chunk.chunkSize))*@as(f64, @floatFromInt(voxelSize));
 	}
 
 	// --- ASHFRAME CUSTOM (interest gating) ---
@@ -466,14 +466,26 @@ pub const User = struct { // MARK: User
 	}
 	// --- ASHFRAME CUSTOM (batched block updates) ---
 
-	/// Effective distance forced by an active teleport ramp: starts at
-	/// `teleportRampFromRD` and expands linearly to the client's distance.
+	/// Effective distance forced by an active teleport ramp: starts below the
+	/// client's distance and expands linearly up to it.
+	///
+	/// The ramp start is clamped to `renderDistance - 1` so the ramp is never a
+	/// no-op. Previously a client whose render distance equalled
+	/// `teleportRampFromRD` (5) ramped 5 -> 5, so `effective == clientRD` and
+	/// `viewCapped` was false: no requests were ever held back. That client
+	/// bypassed the join throttle entirely and flooded the server with its full
+	/// far-LOD request cloud, which the LOD-biased priority then drained ahead
+	/// of the near field - making RD5 joins slower than RD12 ones. Starting one
+	/// below guarantees the near field is served first at every distance.
 	fn teleportRampRD(self: *User, now: i64) u16 {
 		if (now >= self.teleportRampUntil) return self.renderDistance;
 		const span = @as(f64, @floatFromInt(self.teleportRampUntil - self.teleportRampStartMs));
 		const elapsed = @as(f64, @floatFromInt(now - self.teleportRampStartMs));
 		const t = if (span > 0) @min(1.0, @max(0.0, elapsed/span)) else 1.0;
-		const from = @as(f64, @floatFromInt(teleportRampFromRD));
+		// Ramp from just below the client's own distance (but never below the
+		// absolute floor), so `viewCapped` is always true while ramping.
+		const start = @min(teleportRampFromRD, self.renderDistance -| 1);
+		const from = @as(f64, @floatFromInt(@max(start, dynamicRdAbsFloor)));
 		const to = @as(f64, @floatFromInt(self.renderDistance));
 		return @intFromFloat(@max(0.0, from + t*(to - from)));
 	}
