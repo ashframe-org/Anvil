@@ -260,7 +260,8 @@ pub const launchConfig = struct {
 	/// Hunger uses the vanilla energy bar (energy == calories). Drains over
 	/// time, food (`/eat`) restores it, and starving drains health to 1 HP.
 	/// Purely server-side: the vanilla client already renders the energy bar.
-	pub var hungerSystem: bool = true;
+	/// Disabled for now pending balance work; re-enable when ready.
+	pub var hungerSystem: bool = false;
 	// --- ASHFRAME CUSTOM (Hunger) ---
 	// --- ASHFRAME CUSTOM (Bisect toggles) ---
 
