@@ -14,6 +14,15 @@ pub const protocols = @import("network/protocols.zig");
 
 const c = @import("c");
 
+// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 follow-up) ---
+// DF modes for IP_MTU_DISCOVER. DONT = always allow fragmentation (safe normal
+// state). PROBE = set DF and do NOT update the kernel's PMTU (used only for
+// individual probe datagrams; oversized ones are dropped, which is what lets
+// RFC 8899 measure the path MTU instead of the ~64K ceiling). Windows uses a
+// boolean IP_DONTFRAGMENT instead.
+const ipPmtudiscDont: c_int = if (builtin.os.tag == .windows) 0 else std.c.IP.PMTUDISC_DONT;
+const ipPmtudiscProbe: c_int = if (builtin.os.tag == .windows) 1 else std.c.IP.PMTUDISC_PROBE;
+
 // TODO: Might want to use SSL or something similar to encode the message
 
 const ms = 1_000;
@@ -80,12 +89,13 @@ const Socket = struct { // MARK: Socket
 		};
 		errdefer self.deinit();
 		// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 follow-up) ---
-		// Set DF once for the socket's lifetime so oversized probes are
-		// DROPPED, not fragmented (RFC 8899). Without this, probes measure
-		// the fragmentation ceiling (~64K) instead of the path MTU. Best
-		// effort: failure only degrades discovery, so warn and continue.
-		// Single network thread => no flag-flapping hazard.
-		self.setDontFragment();
+		// Start in the SAFE (fragment-allowed) mode. DF is enabled ONLY around
+		// individual probe sends (see sendNextPacketAndGetSize). Setting
+		// IP_MTU_DISCOVER=PMTUDISC_PROBE socket-wide made EVERY send DF, so any
+		// normal packet larger than a client's real path MTU failed with
+		// EMSGSIZE and the client could not join. Single network thread => the
+		// per-probe toggle cannot race.
+		self.setMtuDiscover(ipPmtudiscDont);
 		const bindingAddr = posix.sockaddr.in{
 			.port = @byteSwap(localPort),
 			.addr = 0,
@@ -125,17 +135,18 @@ const Socket = struct { // MARK: Socket
 	}
 
 	// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 follow-up) ---
-	fn setDontFragment(self: Socket) void {
+	/// Sets the DF mode on the socket. Best effort (failure only degrades MTU
+	/// accuracy). Must be called from the single network thread.
+	fn setMtuDiscover(self: Socket, mode: c_int) void {
 		if (builtin.os.tag == .windows) {
 			// NOTE: compile-unverified (no Windows builder here); standard
-			// Winsock2 names. Failure only degrades MTU accuracy.
-			var dont: c_int = 1;
+			// Winsock2 names. PROBE/DONT map to the IP_DONTFRAGMENT boolean.
+			var dont: c_int = if (mode == ipPmtudiscProbe) 1 else 0;
 			if (c.setsockopt(self.socketID, c.IPPROTO_IP, c.IP_DONTFRAGMENT, @ptrCast(&dont), @intCast(@sizeOf(@TypeOf(dont)))) != 0) {
 				std.log.warn("Could not set DF flag on socket, MTU probing may overestimate.", .{});
 			}
 		} else {
-			const probe: c_int = std.c.IP.PMTUDISC_PROBE;
-			const result = std.c.setsockopt(self.socketID, std.c.IPPROTO.IP, std.c.IP.MTU_DISCOVER, &probe, @sizeOf(c_int));
+			const result = std.c.setsockopt(self.socketID, std.c.IPPROTO.IP, std.c.IP.MTU_DISCOVER, &mode, @sizeOf(c_int));
 			switch (std.c.errno(result)) {
 				.SUCCESS => {},
 				else => |e| std.log.warn("Could not set DF flag on socket ({t}), MTU probing may overestimate.", .{e}),
@@ -700,6 +711,16 @@ pub const ConnectionManager = struct { // MARK: ConnectionManager
 			self.socket.send(data, target);
 		}
 	}
+
+	// --- ASHFRAME CUSTOM (MTU probing): per-probe DF toggles. Normal sends run
+	// with DF off (fragmentation allowed) so they never fail with EMSGSIZE. ---
+	pub fn setDontFragment(self: *ConnectionManager) void {
+		self.socket.setMtuDiscover(ipPmtudiscProbe);
+	}
+	pub fn clearDontFragment(self: *ConnectionManager) void {
+		self.socket.setMtuDiscover(ipPmtudiscDont);
+	}
+	// --- ASHFRAME CUSTOM (MTU probing) ---
 
 	pub fn sendRequest(self: *ConnectionManager, allocator: NeverFailingAllocator, data: []const u8, target: SocketAddress, timeout: std.Io.Duration) ?[]const u8 {
 		self.socket.send(data, target);
@@ -1573,7 +1594,12 @@ pub const Connection = struct { // MARK: Connection
 			writer.data.items.len = writer.data.capacity;
 
 			_ = packetsSent.fetchAdd(1, .monotonic);
+			// Enable DF for this probe datagram only: oversized probes are then
+			// dropped (measuring the path MTU) rather than fragmented, without
+			// affecting normal sends. Single network thread => no race.
+			conn.manager.setDontFragment();
 			conn.manager.send(writer.data.items, conn.remoteAddress, null);
+			conn.manager.clearDontFragment();
 			return writer.data.items.len;
 		}
 
