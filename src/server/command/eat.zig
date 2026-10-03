@@ -4,15 +4,12 @@ const main = @import("main");
 const command = main.server.command;
 const Source = command.Source;
 
-pub const description = "Eat food to restore energy (and a little health).";
+pub const description = "Eat food to restore energy and health.";
 pub const usage = "/eat";
 
 pub const Args = union(enum) {
 	@"/eat": struct {},
 };
-
-/// Health restored per food eaten, on top of its energy value.
-const eatHealth: f32 = 3.5;
 
 pub fn execute(args: Args, source: Source) void {
 	_ = args;
@@ -68,11 +65,12 @@ pub fn execute(args: Args, source: Source) void {
 		}}, null);
 	}
 
-	// Restore energy (hunger) by the item's food value, and a little health.
+	// Food restores BOTH hunger and health by its food value. Healing is
+	// hunger-gated (see hunger.zig); eating is the burst that refills it.
 	main.sync.addEnergy(bestFoodValue, .server, user.id);
-	main.sync.addHealth(eatHealth, .heal, .server, user.id);
+	main.sync.addHealth(bestFoodValue, .heal, .server, user.id);
 
-	source.sendMessage("#00ff00Ate {s}§#cfcfcf: restored {d} #00ff00energy.", .{item.name(), bestFoodValue});
+	source.sendMessage("#00ff00Ate {s}§#cfcfcf: restored {d} #00ff00energy#cfcfcf and #00ff00{d}#cfcfcf health.", .{item.name(), bestFoodValue, bestFoodValue});
 
 	prof.apples_eaten +|= 1;
 	main.server.titles.check(user);

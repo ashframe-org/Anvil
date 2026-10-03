@@ -120,6 +120,8 @@ hungerDebt: f32 = 0,
 hungerRegenTimer: f32 = 0,
 hungerStarveTimer: f32 = 0,
 hungerWarnTimer: f32 = 0,
+/// Edge-trigger so the "you are starving" notice is sent once per episode.
+hungerStarveNotified: bool = false,
 // --- ASHFRAME CUSTOM (Hunger) ---
 name: ?[]const u8 = null,
 id: main.entity.Entity = .noValue,
