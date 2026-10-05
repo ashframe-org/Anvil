@@ -1,0 +1,895 @@
+const std = @import("std");
+
+const main = @import("main");
+const blocks = @import("blocks.zig");
+const chunk = @import("chunk.zig");
+const ServerChunk = chunk.ServerChunk;
+const game = @import("game.zig");
+const World = game.World;
+const ServerWorld = main.server.ServerWorld;
+const graphics = @import("graphics.zig");
+const items = @import("items.zig");
+const ItemStack = items.ItemStack;
+const ZonElement = main.ZonElement;
+const physics = main.physics;
+const random = @import("random.zig");
+const settings = @import("settings.zig");
+const utils = @import("utils.zig");
+const vec = @import("vec.zig");
+const Mat4f = vec.Mat4f;
+const Vec3d = vec.Vec3d;
+const Vec3f = vec.Vec3f;
+const Vec3i = vec.Vec3i;
+const BinaryReader = main.utils.BinaryReader;
+const BinaryWriter = main.utils.BinaryWriter;
+const NeverFailingAllocator = main.heap.NeverFailingAllocator;
+
+const c = @import("c");
+
+const ItemDrop = struct { // MARK: ItemDrop
+	pos: Vec3d,
+	vel: Vec3d,
+	rot: Vec3f,
+	onGround: bool = false,
+	itemStack: ItemStack,
+	despawnTime: i32,
+	pickupCooldown: i32,
+
+	reverseIndex: u16,
+};
+
+pub const ItemDropNetworkData = struct {
+	index: u16,
+	pos: Vec3d,
+	vel: Vec3d,
+};
+
+pub const ItemDropManager = struct { // MARK: ItemDropManager
+	/// Half the side length of all item entities hitboxes as a cube.
+	pub const radius: f64 = 0.1;
+	/// Side length of all item entities hitboxes as a cube.
+	pub const diameter: f64 = 2*radius;
+
+	pub const pickupRange: f64 = 1.0;
+
+	const terminalVelocity = 40.0;
+	const gravity = 9.81;
+
+	pub const maxCapacity = 65536;
+
+	allocator: NeverFailingAllocator,
+
+	list: std.MultiArrayList(ItemDrop),
+
+	indices: [maxCapacity]u16 = undefined,
+
+	emptyMutex: main.utils.Mutex = .{},
+	isEmpty: std.bit_set.ArrayBitSet(usize, maxCapacity),
+	// --- ASHFRAME CUSTOM (idempotent drop adds) ---
+	// Slots currently present in `indices[0..size]`. Guards `internalAdd` against a
+	// duplicate add (e.g. an add for a drop the client already has), which would
+	// otherwise be rendered/spawned twice.
+	inList: std.bit_set.ArrayBitSet(usize, maxCapacity) = .empty,
+	// --- ASHFRAME CUSTOM (idempotent drop adds) ---
+
+	changeQueue: main.utils.ConcurrentQueue(union(enum) { add: struct { u16, ItemDrop }, remove: u16 }),
+
+	world: ?*ServerWorld,
+
+	size: u32 = 0,
+
+	pub fn init(self: *ItemDropManager, allocator: NeverFailingAllocator, world: ?*ServerWorld) void {
+		self.* = ItemDropManager{
+			.allocator = allocator,
+			.list = std.MultiArrayList(ItemDrop){},
+			.isEmpty = .full,
+			.inList = .empty,
+			.changeQueue = .init(allocator, 16),
+			.world = world,
+		};
+		self.list.resize(self.allocator.allocator, maxCapacity) catch unreachable;
+	}
+
+	pub fn deinit(self: *ItemDropManager) void {
+		self.processChanges();
+		self.changeQueue.deinit();
+		for (self.indices[0..self.size]) |i| {
+			self.list.items(.itemStack)[i].item.deinit();
+		}
+		self.list.deinit(self.allocator.allocator);
+	}
+
+	pub fn loadFrom(self: *ItemDropManager, zon: ZonElement) void {
+		const zonArray = zon.getChild("array");
+		for (zonArray.toSlice()) |elem| {
+			self.addFromZon(elem);
+		}
+	}
+
+	pub fn loadFromBytes(self: *ItemDropManager, reader: *main.utils.BinaryReader) !void {
+		const version = try reader.readInt(u8);
+		if (version != 0) return error.UnsupportedVersion;
+		var i: u16 = 0;
+		while (reader.remaining.len != 0) : (i += 1) {
+			try self.addFromBytes(reader, i);
+		}
+	}
+
+	pub fn storeToBytes(self: *ItemDropManager, writer: *main.utils.BinaryWriter) void {
+		const version = 0;
+		writer.writeInt(u8, version);
+		for (self.indices[0..self.size]) |i| {
+			storeSingleToBytes(writer, self.list.get(i));
+		}
+	}
+
+	fn addFromBytes(self: *ItemDropManager, reader: *main.utils.BinaryReader, i: u16) !void {
+		const despawnTime = try reader.readInt(i32);
+		const pos = try reader.readVec(Vec3d);
+		const vel = try reader.readVec(Vec3d);
+		const itemStack = try items.ItemStack.fromBytes(reader);
+		self.addWithIndex(i, pos, vel, random.nextFloatVector(3, &main.seed)*@as(Vec3f, @splat(2*std.math.pi)), itemStack, despawnTime, 0);
+	}
+
+	fn storeSingleToBytes(writer: *main.utils.BinaryWriter, itemdrop: ItemDrop) void {
+		writer.writeInt(i32, itemdrop.despawnTime);
+		writer.writeVec(Vec3d, itemdrop.pos);
+		writer.writeVec(Vec3d, itemdrop.vel);
+		itemdrop.itemStack.toBytes(writer);
+	}
+
+	fn addFromZon(self: *ItemDropManager, zon: ZonElement) void {
+		const item = items.Item.init(zon) catch |err| {
+			const msg = zon.toStringEfficient(main.stackAllocator, "");
+			defer main.stackAllocator.free(msg);
+			std.log.err("Ignoring invalid item drop {s} which caused {s}", .{msg, @errorName(err)});
+			return;
+		};
+		const properties = .{
+			zon.get(Vec3d, "pos") orelse .{0, 0, 0},
+			zon.get(Vec3d, "vel") orelse .{0, 0, 0},
+
+			random.nextFloatVector(3, &main.seed)*@as(Vec3f, @splat(2*std.math.pi)),
+			items.ItemStack{.item = item, .amount = zon.get(u16, "amount") orelse 1},
+			zon.get(i32, "despawnTime") orelse 60,
+			0,
+		};
+		if (zon.get(u16, "i")) |i| {
+			@call(.auto, addWithIndex, .{self, i} ++ properties);
+		} else {
+			@call(.auto, add, .{self} ++ properties);
+		}
+	}
+
+	pub fn getPositionAndVelocityData(self: *ItemDropManager, allocator: NeverFailingAllocator) []ItemDropNetworkData {
+		const result = allocator.alloc(ItemDropNetworkData, self.size);
+		for (self.indices[0..self.size], result) |i, *res| {
+			res.* = .{
+				.index = i,
+				.pos = self.list.items(.pos)[i],
+				.vel = self.list.items(.vel)[i],
+			};
+		}
+		return result;
+	}
+
+	pub fn getInitialList(self: *ItemDropManager, allocator: NeverFailingAllocator) ZonElement {
+		self.processChanges(); // Make sure all the items from the queue are included.
+		var list = ZonElement.initArray(allocator);
+		var ii: u32 = 0;
+		while (ii < self.size) : (ii += 1) {
+			const i = self.indices[ii];
+			list.array.append(self.storeSingle(allocator, i));
+		}
+		return list;
+	}
+
+	fn storeDrop(allocator: NeverFailingAllocator, itemDrop: ItemDrop, i: u16) ZonElement {
+		const obj = ZonElement.initObject(allocator);
+		obj.put("i", i);
+		obj.put("pos", itemDrop.pos);
+		obj.put("vel", itemDrop.vel);
+		itemDrop.itemStack.storeToZon(allocator, obj);
+		obj.put("despawnTime", itemDrop.despawnTime);
+		return obj;
+	}
+
+	fn storeSingle(self: *ItemDropManager, allocator: NeverFailingAllocator, i: u16) ZonElement {
+		return storeDrop(allocator, self.list.get(i), i);
+	}
+
+	pub fn store(self: *ItemDropManager, allocator: NeverFailingAllocator) ZonElement {
+		const zonArray = ZonElement.initArray(allocator);
+		for (self.indices[0..self.size]) |i| {
+			const item = self.storeSingle(allocator, i);
+			zonArray.array.append(item);
+		}
+		const zon = ZonElement.initObject(allocator);
+		zon.put("array", zonArray);
+		return zon;
+	}
+
+	pub fn update(self: *ItemDropManager, deltaTime: f32) void {
+		std.debug.assert(self.world != null);
+		self.processChanges();
+		const pos = self.list.items(.pos);
+		const vel = self.list.items(.vel);
+		const onGround = self.list.items(.onGround);
+		const pickupCooldown = self.list.items(.pickupCooldown);
+		const despawnTime = self.list.items(.despawnTime);
+		var ii: u32 = 0;
+		while (ii < self.size) {
+			const i = self.indices[ii];
+			if (self.world.?.getSimulationChunkAndIncreaseRefCount(@trunc(pos[i][0]), @trunc(pos[i][1]), @trunc(pos[i][2]))) |simChunk| {
+				defer simChunk.decreaseRefCount();
+				if (simChunk.getChunk() != null) {
+					// Check collision with blocks:
+					updateEnt(&pos[i], &vel[i], &onGround[i], deltaTime);
+				}
+			}
+			pickupCooldown[i] -= 1;
+			despawnTime[i] -= 1;
+			if (despawnTime[i] < 0) {
+				self.directRemove(i);
+			} else {
+				ii += 1;
+			}
+		}
+	}
+
+	pub fn add(self: *ItemDropManager, pos: Vec3d, vel: Vec3d, rot: Vec3f, itemStack: ItemStack, despawnTime: i32, pickupCooldown: i32) void {
+		self.emptyMutex.lock();
+		const i: u16 = @intCast(self.isEmpty.findFirstSet() orelse {
+			self.emptyMutex.unlock();
+			const itemId = itemStack.item.id() orelse "?";
+			std.log.err("Item drop capacitiy limit reached. Failed to add itemStack: {}×{s}", .{itemStack.amount, itemId});
+			itemStack.item.deinit();
+			return;
+		});
+		self.isEmpty.unset(i);
+		const drop = ItemDrop{
+			.pos = pos,
+			.vel = vel,
+			.rot = rot,
+			.itemStack = itemStack,
+			.despawnTime = despawnTime,
+			.pickupCooldown = pickupCooldown,
+			.reverseIndex = undefined,
+		};
+		if (self.world != null) self.broadcastAdd(i, drop);
+
+		self.emptyMutex.unlock();
+		self.changeQueue.pushBack(.{.add = .{i, drop}});
+	}
+
+	fn addWithIndex(self: *ItemDropManager, i: u16, pos: Vec3d, vel: Vec3d, rot: Vec3f, itemStack: ItemStack, despawnTime: i32, pickupCooldown: i32) void {
+		self.emptyMutex.lock();
+		// Slot already occupied: this is a duplicate add. `itemStack` is a separate
+		// copy owned by this call, so free it exactly once here.
+		if (!self.isEmpty.isSet(i)) {
+			self.emptyMutex.unlock();
+			itemStack.item.deinit();
+			return;
+		}
+		self.isEmpty.unset(i);
+		const drop = ItemDrop{
+			.pos = pos,
+			.vel = vel,
+			.rot = rot,
+			.itemStack = itemStack,
+			.despawnTime = despawnTime,
+			.pickupCooldown = pickupCooldown,
+			.reverseIndex = undefined,
+		};
+		if (self.world != null) self.broadcastAdd(i, drop);
+
+		self.emptyMutex.unlock();
+		self.changeQueue.pushBack(.{.add = .{i, drop}});
+	}
+
+	/// Tells clients to add this drop.
+	/// --- ASHFRAME CUSTOM (interest gating): only in-range players get the
+	/// add (far clients render nothing anyway). Recipients are marked in
+	/// `seenDrops` so removes reach exactly the players that hold the drop,
+	/// and the 2 s sweep (`syncVisibleDrops`) covers walk-into-range.
+	fn broadcastAdd(self: *ItemDropManager, i: u16, drop: ItemDrop) void {
+		const userList = main.server.getUserList(main.stackAllocator);
+		defer main.stackAllocator.free(userList);
+		for (userList) |user| {
+			if (!user.canSeeBlock(@intFromFloat(@trunc(drop.pos[0])), @intFromFloat(@trunc(drop.pos[1])), @intFromFloat(@trunc(drop.pos[2])))) continue;
+			self.sendAdd(user, i, drop);
+			user.seenDrops.set(i);
+		}
+	}
+
+	/// Targeted drop-add packet (shared by broadcast and catch-up sweep).
+	fn sendAdd(_: *ItemDropManager, user: *main.server.User, i: u16, drop: ItemDrop) void {
+		const list = ZonElement.initArray(main.stackAllocator);
+		defer list.deinit(main.stackAllocator);
+		list.array.append(.null);
+		list.array.append(storeDrop(main.stackAllocator, drop, i));
+		const data = list.toStringEfficient(main.stackAllocator, &.{});
+		defer main.stackAllocator.free(data);
+		main.network.protocols.entity.send(user.conn, data);
+	}
+
+	/// Catch-up sweep (runs on the 2 s world tick): players that walked into
+	/// range of a drop they never got the add for receive it now. Removes
+	/// always reach prior recipients (see `directRemove`), so no add is ever
+	/// duplicated and no remove ever dangles — the pairing unguarded
+	/// vanilla/old clients crash on is preserved exactly.
+	pub fn syncVisibleDrops(self: *ItemDropManager, userList: []*main.server.User) void {
+		for (userList) |user| {
+			for (self.indices[0..self.size]) |i| {
+				if (user.seenDrops.isSet(i)) continue;
+				const pos = self.list.items(.pos)[i];
+				if (!user.canSeeBlock(@intFromFloat(@trunc(pos[0])), @intFromFloat(@trunc(pos[1])), @intFromFloat(@trunc(pos[2])))) continue;
+				self.sendAdd(user, i, self.list.get(i));
+				user.seenDrops.set(i);
+			}
+		}
+	}
+
+	/// Marks every live drop seen (join path: the snapshot holds them all, so
+	/// the sweep must not re-send them as duplicate adds).
+	pub fn markAllSeenBy(self: *ItemDropManager, user: *main.server.User) void {
+		for (self.indices[0..self.size]) |i| {
+			user.seenDrops.set(i);
+		}
+	}
+
+	fn processChanges(self: *ItemDropManager) void {
+		while (self.changeQueue.popFront()) |data| {
+			switch (data) {
+				.add => |addData| {
+					self.internalAdd(addData[0], addData[1]);
+				},
+				.remove => |index| {
+					self.internalRemove(index);
+				},
+			}
+		}
+	}
+
+	fn internalAdd(self: *ItemDropManager, i: u16, drop_: ItemDrop) void {
+		var drop = drop_;
+		// --- ASHFRAME CUSTOM (idempotent drop adds) ---
+		// A drop that is already in the list must not be added again, or it would
+		// be rendered/spawned twice. Ownership of `drop.itemStack` moves in only on
+		// the first add; on a duplicate the caller already owns a fresh copy that
+		// must be released here exactly once.
+		if (self.inList.isSet(i)) {
+			drop.itemStack.item.deinit();
+			return;
+		}
+		self.inList.set(i);
+		// --- ASHFRAME CUSTOM (idempotent drop adds) ---
+		if (self.world == null) {
+			ClientItemDropManager.clientSideInternalAdd(self, i, drop);
+		}
+		drop.reverseIndex = @intCast(self.size);
+		self.list.set(i, drop);
+		self.indices[self.size] = i;
+		self.size += 1;
+	}
+
+	fn internalRemove(self: *ItemDropManager, i: u16) void {
+		// --- ASHFRAME CUSTOM (idempotent drop adds) ---
+		// Removing a drop that isn't present must be a no-op; otherwise `size`
+		// underflows and corrupts the list (crash) when a remove for an unknown
+		// drop arrives.
+		if (!self.inList.isSet(i)) return;
+		self.inList.unset(i);
+		self.emptyMutex.lock();
+		self.isEmpty.set(i);
+		self.emptyMutex.unlock();
+		// --- ASHFRAME CUSTOM (idempotent drop adds) ---
+		self.size -= 1;
+		const ii = self.list.items(.reverseIndex)[i];
+		self.list.items(.itemStack)[i].deinit();
+		self.list.items(.itemStack)[i] = .{};
+		self.indices[ii] = self.indices[self.size];
+		self.list.items(.reverseIndex)[self.indices[self.size]] = ii;
+	}
+
+	fn directRemove(self: *ItemDropManager, i: u16) void {
+		std.debug.assert(self.world != null);
+		self.emptyMutex.lock();
+		// --- ASHFRAME CUSTOM (phantom-remove protection + interest gating):
+		// never emit a remove for a drop that isn't live — unguarded clients
+		// corrupt their list (crash) on unknown removes. Removes go only to
+		// players holding the drop (seenDrops), regardless of current range;
+		// players that never got the add have nothing to remove. ---
+		if (!self.inList.isSet(i)) {
+			self.emptyMutex.unlock();
+			return;
+		}
+		const list = ZonElement.initArray(main.stackAllocator);
+		defer list.deinit(main.stackAllocator);
+		list.array.append(.null);
+		list.array.append(.{.int = i});
+		const updateData = list.toStringEfficient(main.stackAllocator, &.{});
+		defer main.stackAllocator.free(updateData);
+		const userList = main.server.getUserList(main.stackAllocator);
+		defer main.stackAllocator.free(userList);
+		for (userList) |user| {
+			if (!user.seenDrops.isSet(i)) continue;
+			main.network.protocols.entity.send(user.conn, updateData);
+			user.seenDrops.unset(i);
+		}
+
+		self.emptyMutex.unlock();
+		self.internalRemove(i);
+	}
+
+	fn updateEnt(pos: *Vec3d, vel: *Vec3d, onGround: *bool, deltaTime: f64) void {
+		const hitBox = physics.collision.Box{.min = @splat(-radius), .max = @splat(radius)};
+		var volumeProperties: physics.collision.VolumeProperties = undefined;
+		physics.calculateVolumeProperties(.server, &volumeProperties, pos.*, hitBox, terminalVelocity);
+
+		var friction: physics.FrictionState = undefined;
+		physics.calculateFriction(.server, &volumeProperties, &friction, pos.*, hitBox, onGround.*);
+		var motion = physics.calculateMotion(.server, deltaTime, friction, volumeProperties, physics.playerDensity, pos.*, vel, @splat(0.0), gravity, 0.0);
+
+		var stepAmount: f64 = 0.0;
+		stepAmount = physics.calculateWallCollision(.server, &motion, pos, vel, onGround, friction, hitBox, 0.1, null, false);
+
+		_ = physics.calculateVerticalCollision(.server, deltaTime, pos, vel, null, onGround, hitBox, motion, 1.0);
+	}
+
+	pub fn checkEntity(self: *ItemDropManager, user: *main.server.User) void {
+		var ii: u32 = 0;
+		while (ii < self.size) {
+			const i = self.indices[ii];
+			if (self.list.items(.pickupCooldown)[i] > 0) {
+				ii += 1;
+				continue;
+			}
+			const hitbox = main.game.Player.outerBoundingBox;
+			const min = user.player().pos + hitbox.min;
+			const max = user.player().pos + hitbox.max;
+			const itemPos = self.list.items(.pos)[i];
+			const dist = @max(min - itemPos, itemPos - max);
+			if (@reduce(.Max, dist) < radius + pickupRange) {
+				const itemStack = &self.list.items(.itemStack)[i];
+				main.items.Inventory.server.tryCollectingToPlayerInventory(user, itemStack);
+				if (itemStack.amount == 0) {
+					self.directRemove(i);
+					continue;
+				}
+			}
+			ii += 1;
+		}
+	}
+};
+
+pub const ClientItemDropManager = struct { // MARK: ClientItemDropManager
+	const maxf64Capacity = ItemDropManager.maxCapacity*@sizeOf(Vec3d)/@sizeOf(f64);
+
+	super: ItemDropManager,
+
+	lastTime: i16,
+
+	timeDifference: utils.TimeDifference = .{},
+
+	interpolation: utils.GenericInterpolation(maxf64Capacity) align(64) = undefined,
+
+	var instance: ?*ClientItemDropManager = null;
+
+	var mutex: main.utils.Mutex = .{};
+
+	pub fn init(self: *ClientItemDropManager, allocator: NeverFailingAllocator) void {
+		std.debug.assert(instance == null); // Only one instance allowed.
+		instance = self;
+		self.* = .{
+			.super = undefined,
+			.lastTime = @as(i16, @truncate(main.timestamp().toMilliseconds())) -% settings.entityLookback,
+		};
+		self.super.init(allocator, null);
+		self.interpolation.init(
+			@ptrCast(self.super.list.items(.pos).ptr),
+			@ptrCast(self.super.list.items(.vel).ptr),
+		);
+	}
+
+	pub fn deinit(self: *ClientItemDropManager) void {
+		std.debug.assert(instance != null); // Double deinit.
+		self.super.deinit();
+		instance = null;
+	}
+
+	pub fn readPosition(self: *ClientItemDropManager, time: i16, itemData: []ItemDropNetworkData) void {
+		self.timeDifference.addDataPoint(time);
+		var pos: [ItemDropManager.maxCapacity]Vec3d = undefined;
+		var vel: [ItemDropManager.maxCapacity]Vec3d = undefined;
+		for (itemData) |data| {
+			pos[data.index] = data.pos;
+			vel[data.index] = data.vel;
+		}
+		mutex.lock();
+		defer mutex.unlock();
+		self.interpolation.updatePosition(@ptrCast(&pos), @ptrCast(&vel), time); // TODO: Only update the ones we actually changed.
+	}
+
+	pub fn updateInterpolationData(self: *ClientItemDropManager) void {
+		self.super.processChanges();
+		var time = @as(i16, @truncate(main.timestamp().toMilliseconds())) -% settings.entityLookback;
+		time -%= self.timeDifference.difference.load(.monotonic);
+		{
+			mutex.lock();
+			defer mutex.unlock();
+			self.interpolation.updateIndexed(time, self.lastTime, self.super.indices[0..self.super.size], 4);
+		}
+		self.lastTime = time;
+	}
+
+	fn clientSideInternalAdd(_: *ItemDropManager, i: u16, drop: ItemDrop) void {
+		mutex.lock();
+		defer mutex.unlock();
+		for (&instance.?.interpolation.lastVel) |*lastVel| {
+			@as(*align(8) [ItemDropManager.maxCapacity]Vec3d, @ptrCast(lastVel))[i] = Vec3d{0, 0, 0};
+		}
+		for (&instance.?.interpolation.lastPos) |*lastPos| {
+			@as(*align(8) [ItemDropManager.maxCapacity]Vec3d, @ptrCast(lastPos))[i] = drop.pos;
+		}
+	}
+
+	pub fn remove(self: *ClientItemDropManager, i: u16) void {
+		// Free the slot synchronously: the server may reuse this index for a new
+		// drop before `processChanges` applies the queued remove, and
+		// `addWithIndex` would then reject that new (legitimate) drop as a
+		// duplicate, leaving it invisible on the client. The remove is still
+		// queued (FIFO) so an in-flight add is applied first.
+		self.super.emptyMutex.lock();
+		self.super.isEmpty.set(i);
+		self.super.emptyMutex.unlock();
+		self.super.changeQueue.pushBack(.{.remove = i});
+	}
+
+	pub fn loadFrom(self: *ClientItemDropManager, zon: ZonElement) void {
+		self.super.loadFrom(zon);
+	}
+
+	pub fn addFromZon(self: *ClientItemDropManager, zon: ZonElement) void {
+		self.super.addFromZon(zon);
+	}
+};
+
+// Going to handle item animations and other things like - bobbing, interpolation, movement reactions
+pub const ItemDisplayManager = struct { // MARK: ItemDisplayManager
+	pub var showItem: bool = true;
+	var cameraFollow: Vec3f = @splat(0);
+	var cameraFollowVel: Vec3f = @splat(0);
+	const damping: Vec3f = @splat(130);
+
+	pub fn update(deltaTime: f64) void {
+		if (deltaTime == 0) return;
+		const dt: f32 = @floatCast(deltaTime);
+
+		var playerVel: Vec3f = .{@floatCast((game.Player.super.vel[2]*0.009 + game.Player.eye.vel[2]*0.0075)), 0, 0};
+		playerVel = vec.clampMag(playerVel, 0.32);
+
+		// TODO: add *smooth* item sway
+		const n1: Vec3f = cameraFollowVel - (cameraFollow - playerVel)*damping*damping*@as(Vec3f, @splat(dt));
+		const n2: Vec3f = @as(Vec3f, @splat(1)) + damping*@as(Vec3f, @splat(dt));
+		cameraFollowVel = n1/(n2*n2);
+
+		cameraFollow += cameraFollowVel*@as(Vec3f, @splat(dt));
+	}
+};
+
+pub const ItemDropRenderer = struct { // MARK: ItemDropRenderer
+	var itemPipeline: graphics.Pipeline = undefined;
+	var itemUniforms: struct {
+		modelMatrix: c_int,
+		ambientLight: c_int,
+		modelIndex: c_int,
+		block: c_int,
+		reflectionMapSize: c_int,
+		contrast: c_int,
+		glDepthRange: c_int,
+	} = undefined;
+
+	var itemModelSSBO: graphics.SSBO = undefined;
+	var modelData: main.ListManaged(u32) = undefined;
+	var freeSlots: main.ListManaged(*ItemVoxelModel) = undefined;
+
+	const ItemVoxelModel = struct {
+		index: u31 = undefined,
+		len: u31 = undefined,
+		item: items.Item,
+
+		fn getSlot(len: u31) u31 {
+			for (freeSlots.items, 0..) |potentialSlot, i| {
+				if (len == potentialSlot.len) {
+					_ = freeSlots.swapRemove(i);
+					const result = potentialSlot.index;
+					main.globalAllocator.destroy(potentialSlot);
+					return result;
+				}
+			}
+			const result: u31 = @intCast(modelData.items.len);
+			modelData.resize(result + len);
+			return result;
+		}
+
+		fn init(template: ItemVoxelModel) *ItemVoxelModel {
+			const self = main.globalAllocator.create(ItemVoxelModel);
+			self.* = ItemVoxelModel{
+				.item = template.item,
+			};
+			if (self.item == .baseItem and self.item.baseItem.block() != null and self.item.baseItem.image().imageData.ptr == graphics.Image.defaultImage.imageData.ptr) {
+				// Find sizes and free index:
+				const block = self.item.baseItem.getDisplayBlock().?;
+				const model = blocks.meshes.model(block).model();
+				var data: main.ListManaged(u32) = .init(main.stackAllocator);
+				defer data.deinit();
+				for (model.internalQuads) |quad| {
+					const textureIndex = blocks.meshes.textureIndex(block, quad.quadInfo().textureSlot);
+					data.append(@as(u32, @intFromEnum(quad)) << 16 | textureIndex); // modelAndTexture
+					data.append(0); // offsetByNormal
+				}
+				for (model.neighborFacingQuads) |list| {
+					for (list) |quad| {
+						const textureIndex = blocks.meshes.textureIndex(block, quad.quadInfo().textureSlot);
+						data.append(@as(u32, @intFromEnum(quad)) << 16 | textureIndex); // modelAndTexture
+						data.append(1); // offsetByNormal
+					}
+				}
+				self.len = @intCast(data.items.len);
+				self.index = getSlot(self.len);
+				@memcpy(modelData.items[self.index..][0..self.len], data.items);
+			} else {
+				// Find sizes and free index:
+				const img = self.item.getImage();
+				const size = Vec3i{img.width, 1, img.height};
+				self.len = @intCast(3 + @reduce(.Mul, size));
+				self.index = getSlot(self.len);
+				var dataSection: []u32 = undefined;
+				dataSection = modelData.items[self.index..][0..self.len];
+				dataSection[0] = @intCast(size[0]);
+				dataSection[1] = @intCast(size[1]);
+				dataSection[2] = @intCast(size[2]);
+				var i: u32 = 3;
+				var z: u32 = 0;
+				while (z < 1) : (z += 1) {
+					var x: u32 = 0;
+					while (x < img.width) : (x += 1) {
+						var y: u32 = 0;
+						while (y < img.height) : (y += 1) {
+							dataSection[i] = img.getRGB(x, y).toArgb();
+							i += 1;
+						}
+					}
+				}
+			}
+			itemModelSSBO.bufferData(u32, modelData.items);
+			return self;
+		}
+
+		fn deinit(self: *ItemVoxelModel) void {
+			freeSlots.append(self);
+		}
+
+		pub fn equals(self: ItemVoxelModel, other: ?*ItemVoxelModel) bool {
+			if (other == null) return false;
+			return std.meta.eql(self.item, other.?.item);
+		}
+
+		pub fn hashCode(self: ItemVoxelModel) u32 {
+			return self.item.hashCode();
+		}
+	};
+
+	pub fn init() void {
+		itemPipeline = graphics.Pipeline.init(
+			"assets/cubyz/shaders/item_drop.vert",
+			"assets/cubyz/shaders/item_drop.frag",
+			"",
+			&itemUniforms,
+			graphics.VertexArray.EmptyVertex,
+			.{
+				.rasterState = .{},
+				.depthStencilState = .{.depthTest = true},
+				.blendState = .{.attachments = &.{.alphaBlending}, .formats = &.{.world}},
+			},
+		);
+		itemModelSSBO = .init();
+		itemModelSSBO.bufferData(i32, &[3]i32{1, 1, 1});
+		itemModelSSBO.bind(2);
+
+		modelData = .init(main.globalAllocator);
+		freeSlots = .init(main.globalAllocator);
+	}
+
+	pub fn deinit() void {
+		itemPipeline.deinit();
+		itemModelSSBO.deinit();
+		modelData.deinit();
+		voxelModels.clear();
+		for (freeSlots.items) |freeSlot| {
+			main.globalAllocator.destroy(freeSlot);
+		}
+		freeSlots.deinit();
+	}
+
+	var voxelModels: utils.Cache(ItemVoxelModel, 32, 32, ItemVoxelModel.deinit) = .{};
+
+	fn getModel(item: items.Item) *ItemVoxelModel {
+		const compareObject = ItemVoxelModel{.item = item};
+		return voxelModels.findOrCreate(compareObject, ItemVoxelModel.init, null);
+	}
+
+	fn bindCommonUniforms(ambientLight: Vec3f) void {
+		itemPipeline.bind(null);
+		c.glUniform1f(itemUniforms.reflectionMapSize, main.renderer.reflectionCubeMapSize);
+		c.glUniform3fv(itemUniforms.ambientLight, 1, @ptrCast(&ambientLight));
+		c.glUniform1f(itemUniforms.contrast, 0.12);
+		var depthRange: [2]f32 = undefined;
+		c.glGetFloatv(c.GL_DEPTH_RANGE, &depthRange);
+		c.glUniform2fv(itemUniforms.glDepthRange, 1, &depthRange);
+	}
+
+	fn bindLightUniform(light: [6]u8, ambientLight: Vec3f) void {
+		const sunLight: Vec3f = ambientLight*@as(Vec3f, @floatFromInt(Vec3i{light[0], light[1], light[2]}))/@as(Vec3f, @splat(255));
+		const blockLight: Vec3f = @as(Vec3f, @floatFromInt(Vec3i{light[3], light[4], light[5]}))/@as(Vec3f, @splat(255));
+		c.glUniform3fv(itemUniforms.ambientLight, 1, @ptrCast(&@min(@sqrt(sunLight*sunLight + blockLight*blockLight), @as(Vec3f, @splat(1)))));
+	}
+
+	fn bindModelUniforms(modelIndex: u31, blockType: u16) void {
+		c.glUniform1i(itemUniforms.modelIndex, modelIndex);
+		c.glUniform1i(itemUniforms.block, blockType);
+	}
+
+	fn drawItem(vertices: u31, modelMatrix: Mat4f) void {
+		c.glUniformMatrix4fv(itemUniforms.modelMatrix, 1, c.GL_TRUE, @ptrCast(&modelMatrix));
+		main.renderer.chunk_meshing.vao.bind();
+		c.glDrawElements(c.GL_TRIANGLES, vertices, c.GL_UNSIGNED_INT, null);
+	}
+
+	pub fn renderItemDrops(ambientLight: Vec3f, playerPos: Vec3d) void {
+		game.world.?.itemDrops.updateInterpolationData();
+
+		bindCommonUniforms(ambientLight);
+		const itemDrops = &game.world.?.itemDrops.super;
+		for (itemDrops.indices[0..itemDrops.size]) |i| {
+			const item = itemDrops.list.items(.itemStack)[i].item;
+			if (item != .null) {
+				var pos = itemDrops.list.items(.pos)[i];
+				const rot = itemDrops.list.items(.rot)[i];
+				const blockPos: Vec3i = @floor(pos);
+				const light: [6]u8 = main.renderer.mesh_storage.getLight(blockPos[0], blockPos[1], blockPos[2]) orelse @splat(0);
+				bindLightUniform(light, ambientLight);
+				pos -= playerPos;
+
+				const model = getModel(item);
+				var vertices: u31 = 36;
+
+				var scale: f32 = 0.3;
+				var blockType: u16 = 0;
+				if (item == .baseItem and item.baseItem.block() != null and item.baseItem.image().imageData.ptr == graphics.Image.defaultImage.imageData.ptr) {
+					blockType = item.baseItem.block().?;
+					vertices = model.len/2*6;
+				} else {
+					scale = 0.5;
+				}
+				bindModelUniforms(model.index, blockType);
+
+				var modelMatrix = Mat4f.translation(@floatCast(pos));
+				modelMatrix = modelMatrix.mul(Mat4f.rotationX(-rot[0]));
+				modelMatrix = modelMatrix.mul(Mat4f.rotationY(-rot[1]));
+				modelMatrix = modelMatrix.mul(Mat4f.rotationZ(-rot[2]));
+				modelMatrix = modelMatrix.mul(Mat4f.scale(@splat(scale)));
+				modelMatrix = modelMatrix.mul(Mat4f.translation(@splat(-0.5)));
+				drawItem(vertices, modelMatrix);
+			}
+		}
+	}
+
+	inline fn getIndex(x: u8, y: u8, z: u8) u32 {
+		return (z*4) + (y*2) + (x);
+	}
+
+	inline fn blendColors(a: [6]f32, b: [6]f32, t: f32) [6]f32 {
+		var result: [6]f32 = .{0, 0, 0, 0, 0, 0};
+		inline for (0..6) |i| {
+			result[i] = std.math.lerp(a[i], b[i], t);
+		}
+		return result;
+	}
+
+	pub fn renderDisplayItems(ambientLight: Vec3f, playerPos: Vec3d) void {
+		if (!ItemDisplayManager.showItem) return;
+
+		const displayItemUbo = graphics.frame_uniforms.StaticUbo.init(.{
+			.projectionMatrix = Mat4f.perspective(std.math.degreesToRadians(65), @as(f32, @floatFromInt(main.renderer.lastWidth))/@as(f32, @floatFromInt(main.renderer.lastHeight)), 0.01, 3).toGl(),
+			.viewMatrix = Mat4f.identity().toGl(),
+			.playerPositionInteger = @splat(0),
+			.playerPositionFraction = @splat(0),
+		});
+		defer displayItemUbo.deinit();
+		displayItemUbo.bind();
+		defer displayItemUbo.unbind();
+		bindCommonUniforms(ambientLight);
+
+		const item = game.Player.inventory.getItem(game.Player.selectedSlot);
+		if (item != .null) {
+			var pos: Vec3d = Vec3d{0, 0, 0};
+			const rot: Vec3f = ItemDisplayManager.cameraFollow;
+
+			const lightPos = @as(Vec3d, @floatCast(playerPos)) - @as(Vec3f, @splat(0.5));
+			const blockPos: Vec3i = @floor(lightPos);
+			const localBlockPos: Vec3f = @floatCast(lightPos - @as(Vec3d, @floatFromInt(blockPos)));
+
+			var samples: [8][6]f32 = @splat(@splat(0));
+			inline for (0..2) |z| {
+				inline for (0..2) |y| {
+					inline for (0..2) |x| {
+						const light: [6]u8 = main.renderer.mesh_storage.getLight(
+							blockPos[0] +% @as(i32, @intCast(x)),
+							blockPos[1] +% @as(i32, @intCast(y)),
+							blockPos[2] +% @as(i32, @intCast(z)),
+						) orelse @splat(0);
+
+						inline for (0..6) |i| {
+							samples[getIndex(x, y, z)][i] = @as(f32, @floatFromInt(light[i]));
+						}
+					}
+				}
+			}
+
+			inline for (0..2) |y| {
+				inline for (0..2) |x| {
+					samples[getIndex(x, y, 0)] = blendColors(samples[getIndex(x, y, 0)], samples[getIndex(x, y, 1)], localBlockPos[2]);
+				}
+			}
+
+			inline for (0..2) |x| {
+				samples[getIndex(x, 0, 0)] = blendColors(samples[getIndex(x, 0, 0)], samples[getIndex(x, 1, 0)], localBlockPos[1]);
+			}
+
+			var result: [6]u8 = .{0, 0, 0, 0, 0, 0};
+			inline for (0..6) |i| {
+				const val = std.math.lerp(samples[getIndex(0, 0, 0)][i], samples[getIndex(1, 0, 0)][i], localBlockPos[0]);
+				result[i] = @floor(val);
+			}
+
+			bindLightUniform(result, ambientLight);
+
+			const model = getModel(item);
+			var vertices: u31 = 36;
+
+			const isBlock: bool = item == .baseItem and item.baseItem.block() != null and item.baseItem.image().imageData.ptr == graphics.Image.defaultImage.imageData.ptr;
+			var scale: f32 = 0;
+			var blockType: u16 = 0;
+			if (isBlock) {
+				blockType = item.baseItem.block().?;
+				vertices = model.len/2*6;
+				scale = 0.3;
+				pos = Vec3d{0.4, 0.55, -0.32};
+			} else {
+				scale = 0.57;
+				pos = Vec3d{0.4, 0.65, -0.3};
+			}
+			bindModelUniforms(model.index, blockType);
+
+			var modelMatrix = Mat4f.rotationZ(-rot[2]);
+			modelMatrix = modelMatrix.mul(Mat4f.rotationY(-rot[1]));
+			modelMatrix = modelMatrix.mul(Mat4f.rotationX(-rot[0]));
+			modelMatrix = modelMatrix.mul(Mat4f.translation(@floatCast(pos)));
+			if (!isBlock) {
+				if (item == .proceduralItem) {
+					modelMatrix = modelMatrix.mul(Mat4f.rotationZ(-std.math.pi*0.47));
+					modelMatrix = modelMatrix.mul(Mat4f.rotationY(std.math.pi*0.25));
+				} else {
+					modelMatrix = modelMatrix.mul(Mat4f.rotationZ(-std.math.pi*0.45));
+				}
+			} else {
+				modelMatrix = modelMatrix.mul(Mat4f.rotationZ(-std.math.pi*0.2));
+			}
+			modelMatrix = modelMatrix.mul(Mat4f.scale(@splat(scale)));
+			modelMatrix = modelMatrix.mul(Mat4f.translation(@splat(-0.5)));
+			drawItem(vertices, modelMatrix);
+		}
+	}
+};
