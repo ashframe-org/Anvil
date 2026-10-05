@@ -10,6 +10,21 @@ const User = main.server.User;
 
 pub const maxStrikes: u8 = 3;
 
+/// Accounts (public keys) that are never struck or banned. The Discord relay
+/// bot posts other people's messages under its own name, so strikes for those
+/// messages banned the bot itself. Its messages are still filtered.
+const protectedKeys = [_][]const u8{
+	"ed25519:tXajORkxhbvHEcysimVBh12MG3Wq8M+VJ9jitttwGU8=", // Discord relay bot
+};
+
+pub fn isProtected(key: ?[]const u8) bool {
+	const k = key orelse return false;
+	for (protectedKeys) |p| {
+		if (std.mem.eql(u8, p, k)) return true;
+	}
+	return false;
+}
+
 /// Severe terms only. Matched against the normalised (lowercased, stripped)
 /// text, so spacing/punctuation obfuscation is caught.
 const blocklist = [_][]const u8{
@@ -158,7 +173,14 @@ pub fn findBad(text: []const u8) ?[]const u8 {
 		// Short terms are ambiguous ("kys" in "skyscraper"), so require a word.
 		// Short terms are checked against the normalised text too, so leet
 		// variants ("ky5") don't evade the whole-word rule.
-		if (termFlat.items.len >= 5) {
+		if (std.mem.indexOfScalar(u8, termNorm.items, ' ') != null) {
+			// Multi-word phrases: never substring-match the space-stripped
+			// text, that glued unrelated words ("lon(g as the)re" -> "gas
+			// the") and struck innocent chat. Match whole words, or a single
+			// glued token / letter-by-letter run that starts or ends with it.
+			if (containsWord(norm.items, termNorm.items) or containsWord(normI.items, termNorm.items)) return term;
+			if (containsGlued(norm.items, termFlat.items) or containsGlued(normI.items, termFlat.items)) return term;
+		} else if (termFlat.items.len >= 5) {
 			if (std.mem.indexOf(u8, norm.items, termNorm.items) != null) return term;
 			if (std.mem.indexOf(u8, normFlat.items, termFlat.items) != null) return term;
 			if (std.mem.indexOf(u8, normI.items, termNorm.items) != null) return term;
@@ -168,6 +190,25 @@ pub fn findBad(text: []const u8) ?[]const u8 {
 		}
 	}
 	return null;
+}
+
+/// True if `flat` (a phrase with spaces removed) is a whole token of the
+/// normalised text, or the start/end of one ("killYourself", "gasthe..."),
+/// or sits inside a run of single letters ("g a s t h e").
+fn containsGlued(norm: []const u8, flat: []const u8) bool {
+	var spelled = main.ListManaged(u8).init(main.stackAllocator);
+	defer spelled.deinit();
+	var it = std.mem.tokenizeScalar(u8, norm, ' ');
+	while (it.next()) |token| {
+		if (token.len == 1) {
+			spelled.append(token[0]);
+			if (std.mem.indexOf(u8, spelled.items, flat) != null) return true;
+			continue;
+		}
+		spelled.clearRetainingCapacity();
+		if (std.mem.startsWith(u8, token, flat) or std.mem.endsWith(u8, token, flat)) return true;
+	}
+	return false;
 }
 
 // --- Ban list ---
@@ -205,6 +246,8 @@ fn normName(out: *main.ListManaged(u8), text: []const u8) void {
 }
 
 pub fn isBanned(name: []const u8, key: ?[]const u8) bool {
+	// Checked first so a name ban (manual `/ban Discord`) can't lock it out either.
+	if (isProtected(key)) return false;
 	bansMutex.lock();
 	defer bansMutex.unlock();
 	ensure();
@@ -291,6 +334,7 @@ pub fn unban(name: []const u8) bool {
 
 /// Applies a strike. Returns true if the player is now banned.
 pub fn strike(user: *User) bool {
+	if (isProtected(user.newKeyString)) return false;
 	const prof = user.player();
 	prof.strikes +|= 1;
 	if (prof.strikes >= maxStrikes) {

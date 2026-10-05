@@ -598,6 +598,7 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 		server.alliances.load(path);
 		server.waypoints.load(path);
 		server.chatfilter.load(path);
+		server.discordlink.load(path);
 		server.shrines.load(path);
 		server.shops.load(path);
 		server.anticheat.load(path);
@@ -631,6 +632,7 @@ pub const ServerWorld = struct { // MARK: ServerWorld
 		server.alliances.save(self.path);
 		server.waypoints.save(self.path);
 		server.chatfilter.save(self.path);
+		server.discordlink.save();
 		server.shrines.save(self.path);
 		server.shops.save(self.path);
 		server.anticheat.save(self.path);

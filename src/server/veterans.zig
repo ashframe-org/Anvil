@@ -599,3 +599,26 @@ test "veteran season bits iterate the full mask without overflow" {
 		}
 	}
 }
+
+// --- ASHFRAME CUSTOM (Discord account recovery) ---
+/// Moves season history from `oldKey` to `newKey` (merging if the new key
+/// already has some) and saves. Server thread. Returns 1 if anything moved.
+pub fn rekey(oldKey: []const u8, newKey: []const u8) usize {
+	load();
+	const oldIdx = for (keys.items, 0..) |e, i| {
+		if (std.mem.eql(u8, e.key, oldKey)) break i;
+	} else return 0;
+	const old = keys.swapRemove(oldIdx);
+	defer main.globalAllocator.free(old.key);
+	for (keys.items) |*e| {
+		if (std.mem.eql(u8, e.key, newKey)) {
+			e.seasons |= old.seasons;
+			save();
+			return 1;
+		}
+	}
+	keys.append(.{.key = main.globalAllocator.dupe(u8, newKey), .seasons = old.seasons});
+	save();
+	return 1;
+}
+// --- ASHFRAME CUSTOM (Discord account recovery) ---

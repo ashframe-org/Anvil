@@ -155,6 +155,15 @@ const Socket = struct { // MARK: Socket
 	}
 
 	fn send(self: Socket, data: []const u8, destination: SocketAddress) void {
+		if (self.sendReportTooBig(data, destination)) {
+			std.log.warn("Got error while sending to {f}: MSGSIZE", .{destination});
+		}
+	}
+
+	/// Like `send`, but returns true instead of warning when the datagram is
+	/// larger than the local interface allows (EMSGSIZE). Used by MTU probes,
+	/// where that just means the probe size is above the local limit.
+	fn sendReportTooBig(self: Socket, data: []const u8, destination: SocketAddress) bool {
 		const addr, const addrLen = blk: {
 			var posixAddr: std.Io.Threaded.PosixAddress = undefined;
 			const addrLen = std.Io.Threaded.addressToPosix(&destination.address, &posixAddr);
@@ -174,11 +183,13 @@ const Socket = struct { // MARK: Socket
 				.SUCCESS => {
 					std.debug.assert(data.len == result);
 				},
+				.MSGSIZE => return true,
 				else => |err| {
 					std.log.warn("Got error while sending to {f}: {s}", .{destination, @tagName(err)});
 				},
 			}
 		}
+		return false;
 	}
 
 	fn receive(self: Socket, buffer: []u8, timeout: i32, resultAddress: *SocketAddress) ![]u8 {
@@ -714,11 +725,12 @@ pub const ConnectionManager = struct { // MARK: ConnectionManager
 
 	// --- ASHFRAME CUSTOM (MTU probing): per-probe DF toggles. Normal sends run
 	// with DF off (fragmentation allowed) so they never fail with EMSGSIZE. ---
-	pub fn setDontFragment(self: *ConnectionManager) void {
+	/// Sends one probe datagram with DF set. Returns true if the kernel
+	/// rejected it as larger than the local interface MTU (EMSGSIZE).
+	pub fn sendProbe(self: *ConnectionManager, data: []const u8, target: SocketAddress) bool {
 		self.socket.setMtuDiscover(ipPmtudiscProbe);
-	}
-	pub fn clearDontFragment(self: *ConnectionManager) void {
-		self.socket.setMtuDiscover(ipPmtudiscDont);
+		defer self.socket.setMtuDiscover(ipPmtudiscDont);
+		return self.socket.sendReportTooBig(data, target);
 	}
 	// --- ASHFRAME CUSTOM (MTU probing) ---
 
@@ -1454,7 +1466,7 @@ pub const Connection = struct { // MARK: Connection
 			if (!u.isArgon() or (u.ashframeClientVersion orelse 0) < main.server.User.mtuProbeVersion) return false;
 			switch (self.*) {
 				.searching => |*state| {
-					if (conn.mtuEstimate >= maxProbeSize) {
+					if (conn.mtuEstimate >= maxProbeSize or conn.mtuEstimate +| 1 >= conn.mtuProbeCeiling) {
 						self.* = .{.searchFinished = .{
 							.timestamp = time,
 						}};
@@ -1490,6 +1502,7 @@ pub const Connection = struct { // MARK: Connection
 						return false;
 					}
 					if (conn.mtuEstimate >= maxProbeSize) return false;
+					if (conn.mtuEstimate +| 1 >= conn.mtuProbeCeiling) return false;
 					self.* = .{.searching = .{}};
 					return true;
 				},
@@ -1500,7 +1513,7 @@ pub const Connection = struct { // MARK: Connection
 			std.debug.assert(self.* == .searching);
 			// Probe one step below the ceiling while there is headroom, so
 			// loss at the very top still leaves a usable estimate.
-			self.searching.probedSize = nextProbeSizeFor(conn.mtuEstimate, self.searching.probeStep);
+			self.searching.probedSize = @min(nextProbeSizeFor(conn.mtuEstimate, self.searching.probeStep), conn.mtuProbeCeiling - 1);
 			return self.searching.probedSize;
 		}
 
@@ -1593,13 +1606,20 @@ pub const Connection = struct { // MARK: Connection
 			writer.writeInt(SequenceIndex, sequenceIndex);
 			writer.data.items.len = writer.data.capacity;
 
-			_ = packetsSent.fetchAdd(1, .monotonic);
 			// Enable DF for this probe datagram only: oversized probes are then
 			// dropped (measuring the path MTU) rather than fragmented, without
 			// affecting normal sends. Single network thread => no race.
-			conn.manager.setDontFragment();
-			conn.manager.send(writer.data.items, conn.remoteAddress, null);
-			conn.manager.clearDontFragment();
+			if (conn.manager.sendProbe(writer.data.items, conn.remoteAddress)) {
+				// Bigger than the local interface allows (e.g. a WireGuard
+				// tunnel): it never left this machine, so it says nothing about
+				// the path or loss. Lower the ceiling and keep searching under
+				// it instead of letting the unsent probes time out.
+				conn.mtuProbeCeiling = @min(conn.mtuProbeCeiling, @as(u16, @intCast(writer.data.items.len)));
+				conn.mtuProbingState.searching.probeInFlightCount -|= 1;
+				std.log.debug("[mtu] probe of {d}B exceeds the local interface, capping below it", .{writer.data.items.len});
+				return null;
+			}
+			_ = packetsSent.fetchAdd(1, .monotonic);
 			return writer.data.items.len;
 		}
 
@@ -1886,6 +1906,9 @@ pub const Connection = struct { // MARK: Connection
 	/// Used by the loss-adaptive reset to distinguish "our probes are too
 	/// big for this path" from "this path just drops packets sometimes".
 	lossStreak: u16 = 0,
+	/// Smallest probe size the local interface rejected (EMSGSIZE). Probes
+	/// stay below it, e.g. a WireGuard tunnel's 1420 MTU caps payloads at 1392.
+	mtuProbeCeiling: u16 = ProbingState.maxProbeSize,
 	// --- ASHFRAME CUSTOM (MTU probing) ---
 
 	bandwidthEstimateInBytesPerRtt: f32 = minMtu,
@@ -2068,7 +2091,13 @@ pub const Connection = struct { // MARK: Connection
 			// cause). Otherwise keep the working estimate and let the normal
 			// search back off via maxProbes. Also only back off a fraction
 			// of the way rather than all the way to minMtu.
-			if (self.handShakeState.load(.acquire) == .complete and self.mtuEstimate > minMtu) {
+			// The estimate only ever rises on a confirmed probe, so loss at that
+			// size is congestion, not size: count streaks only while a probe is
+			// actually in flight. (Previously any loss counted, and the heavy
+			// chunk traffic at the top of each search knocked every player
+			// back down to 548B in a loop.)
+			const probing = self.mtuProbingState == .searching and self.mtuProbingState.searching.probeInFlightCount > 0;
+			if (self.handShakeState.load(.acquire) == .complete and self.mtuEstimate > minMtu and probing) {
 				self.lossStreak +|= 1;
 				// A burst of consecutive double-losses is the signal that
 				// the current size is likely too large for the path.

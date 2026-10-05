@@ -265,8 +265,26 @@ pub const server = struct { // MARK: server
 		source.receiveCommand(reader.remaining);
 	}
 
+	// --- ASHFRAME CUSTOM (Discord account link) ---
+	/// Queues `message` (without the leading '/') exactly as if the client had
+	/// sent it as a chat command; it runs on the server thread in User.update.
+	/// The Discord relay's client library can only send chat messages.
+	pub fn queueChatCommand(source: *main.server.User, message: []const u8) void {
+		var writer = BinaryWriter.init(main.stackAllocator);
+		defer writer.deinit();
+		writer.writeEnum(Command.PayloadType, .chatCommand);
+		(Command.ChatCommand{.message = message}).serialize(&writer);
+		source.receiveCommand(writer.data.items);
+	}
+	// --- ASHFRAME CUSTOM (Discord account link) ---
+
 	fn setGamemode(user: *main.server.User, gamemode: Gamemode) void {
 		threadContext.assertCorrectContext(.server);
+		// --- ASHFRAME CUSTOM (Anticheat v2) ---
+		// The client keeps flying until it receives the new gamemode; don't
+		// judge that round trip as survival movement.
+		main.server.anticheat.expectTeleport(user);
+		// --- ASHFRAME CUSTOM (Anticheat v2) ---
 		user.gamemode.store(gamemode, .monotonic);
 		main.network.protocols.genericUpdate.sendGamemode(user.conn, gamemode);
 	}
@@ -939,7 +957,7 @@ pub const Command = struct { // MARK: Command
 						// without going through sendTPCoordinates, so grant the
 						// teleport grace window here or every respawn pings the
 						// movement anticheat.
-						main.server.anticheat.expectTeleport(info.target.?);
+						main.server.anticheat.expectTeleportTo(info.target.?, info.target.?.getSpawnPos());
 						// --- ASHFRAME CUSTOM (Respawn grace) ---
 
 						self.syncOperations.append(allocator, .{.kill = .{
@@ -1865,6 +1883,23 @@ pub const Command = struct { // MARK: Command
 				}
 				// --- ASHFRAME CUSTOM (Anticheat) ---
 
+				// --- ASHFRAME CUSTOM (Anticheat v2: break-speed budget) ---
+				// A break (block type changes, not paid for with items) costs
+				// the tool's real break time from a per-player budget, which
+				// stops fast mine, nuker and creative-spoof instant break.
+				if (ctx.user) |u| {
+					const isBreak = self.newBlock.typ != self.oldBlock.typ and costOfChange != .yes_costsItems;
+					if (ctx.gamemode != .creative and isBreak and !main.server.anticheat.checkBreak(u, self.oldBlock, stack.*)) {
+						var writer = BinaryWriter.init(main.stackAllocator);
+						defer writer.deinit();
+						const actualBlock = main.server.world.?.getBlockAndBlockEntityData(pos[0], pos[1], pos[2], &writer) orelse return;
+						main.network.protocols.blockUpdate.send(u.conn, &.{.init(pos, actualBlock, writer.data.items)});
+						// Fail so the client restores its tool/item state.
+						return error.serverFailure;
+					}
+				}
+				// --- ASHFRAME CUSTOM (Anticheat v2) ---
+
 				// --- ASHFRAME CUSTOM (Waypoints: owner-only break) ---
 				if (ctx.user) |u| {
 					const waypointTyp = main.blocks.getTypeById("ashframe:waypoint");
@@ -1912,10 +1947,9 @@ pub const Command = struct { // MARK: Command
 					main.server.shops.onBroken(.{pos[0], pos[1], pos[2]}, self.oldBlock);
 				}
 				// --- ASHFRAME CUSTOM (Sign shops) ---
-				// NOTE: break-time (instant-break) enforcement was tried here and
-				// REMOVED: legitimate god-tier pickaxes break fast enough to trip
-				// any timing model, and lag batches false-positive. Break speed is
-				// not policed; cost/claims/reach above still are.
+				// NOTE: a per-break timing check was tried here and removed (lag
+				// batches, fast pickaxes). Break speed is now policed by the
+				// tool-scaled budget above (anticheat.checkBreak) instead.
 			}
 
 			if (ctx.side == .server) {
@@ -2185,3 +2219,17 @@ pub const ThreadContext = enum { // MARK: ThreadContext
 		}
 	}
 };
+
+// --- ASHFRAME CUSTOM (Discord account link) ---
+test "relay chat command encodes like a client chat command" {
+	var writer = BinaryWriter.init(main.heap.testingAllocator);
+	defer writer.deinit();
+	writer.writeEnum(Command.PayloadType, .chatCommand);
+	(Command.ChatCommand{.message = "relay link abc ABCD2345 123456789012345678 me"}).serialize(&writer);
+	var reader = utils.BinaryReader.init(writer.data.items);
+	try std.testing.expectEqual(Command.PayloadType.chatCommand, try reader.readEnum(Command.PayloadType));
+	const decoded = try Command.ChatCommand.deserialize(&reader, .server, null);
+	defer main.globalAllocator.free(decoded.message);
+	try std.testing.expectEqualStrings("relay link abc ABCD2345 123456789012345678 me", decoded.message);
+}
+// --- ASHFRAME CUSTOM (Discord account link) ---

@@ -38,6 +38,7 @@ pub const claims = @import("claims.zig");
 pub const veterans = @import("veterans.zig");
 pub const waypoints = @import("waypoints.zig");
 pub const chatfilter = @import("chatfilter.zig");
+pub const discordlink = @import("discordlink.zig");
 pub const shrines = @import("shrines.zig");
 pub const hunger = @import("hunger.zig");
 pub const shops = @import("shops.zig");
@@ -166,6 +167,7 @@ fn ensureDefaultCommandPermissions(id: main.entity.Entity) void {
 		"/command/players",  "/command/playtime", "/command/stats",    "/command/afk",
 		"/command/tpdeny",   "/command/msg",      "/command/alliance", "/command/claim",
 		"/command/eat",      "/command/titles",   "/command/title",    "/command/shop",
+		"/command/link",     "/command/recover",
 		// Note: "/command/veteran" is granted so admins can invoke it, but the
 		// command additionally gates on "/ashframe/admin/veteran" (NOT granted
 		// by default), same pattern as /prefix and /spawn.
@@ -296,6 +298,36 @@ pub const User = struct { // MARK: User
 	/// fast player can't generate 20 notes/second (each a log + allocations +
 	/// O(n) report bookkeeping) and stall the tick.
 	noteMuteUntilMs: [std.meta.fields(anticheat.Category).len]i64 = @splat(0),
+	// --- ASHFRAME CUSTOM (Anticheat v2) ---
+	// Server-authoritative movement (network thread, under `mutex`).
+	acLastGood: ?[3]f64 = null,
+	acLastGoodTime: i64 = 0,
+	acGroundPos: ?[3]f64 = null,
+	acMoveBudget: f64 = anticheat.moveBurst,
+	acFallBudget: f64 = anticheat.fallBurst,
+	acAir: anticheat.AirState = .{},
+	acSetbackPos: ?[3]f64 = null,
+	acSetbackSentMs: i64 = 0,
+	acSetbackStartMs: i64 = 0,
+	acSetbacks: u32 = 0,
+	acSetbackWindowStart: i64 = 0,
+	// Break-speed budget (server thread, command path).
+	// Noclip check (server thread, `anticheat.checkNoclipTick`).
+	acNoclipSafePos: ?[3]f64 = null,
+	acNoclipStrikes: u8 = 0,
+	acNoclipReset: bool = false,
+	acMineBudget: f64 = anticheat.mineBurst,
+	acMineLastMs: i64 = 0,
+	acMineRejects: u32 = 0,
+	acMineRejectWindowStart: i64 = 0,
+	// Destination of the last server teleport the client hasn't reached yet
+	// (`anticheat.expectTeleportTo`). Own mutex: set from sendTPCoordinates,
+	// which can run with or without `mutex` held. Lock order: mutex first.
+	acTeleportMutex: main.utils.Mutex = .{},
+	acTeleportTarget: ?[3]f64 = null,
+	acTeleportSentMs: i64 = 0,
+	/// True while `anticheat.setback` sends its teleport (it tracks its own target).
+	acInSetback: bool = false,
 	// --- ASHFRAME CUSTOM (Anticheat) ---
 
 	// --- ASHFRAME CUSTOM (Dynamic render distance) ---
@@ -364,6 +396,26 @@ pub const User = struct { // MARK: User
 		const v = self.ashframeClientVersion orelse return false;
 		return v >= minArgonVersion;
 	}
+
+	// --- ASHFRAME CUSTOM (client version gate) ---
+	/// Vanilla versions allowed to join (release and built-from-source).
+	const allowedVanillaVersions = [_][]const u8{ "0.4.1", "0.4.1-dev" };
+
+	/// Any Argon client, vanilla 0.4.1, or a protected account (the Discord
+	/// relay bot reports 0.4.0). Everything else (0.5.0-dev, 0.3.x, ...) is
+	/// refused at the handshake. Needs `newKeyString`, so call after identify.
+	pub fn isAllowedClient(self: *const User, clientVersion: []const u8) bool {
+		return clientAllowed(self.isArgon(), chatfilter.isProtected(self.newKeyString), clientVersion);
+	}
+
+	pub fn clientAllowed(argon: bool, protected: bool, clientVersion: []const u8) bool {
+		if (argon or protected) return true;
+		for (allowedVanillaVersions) |v| {
+			if (std.mem.eql(u8, clientVersion, v)) return true;
+		}
+		return false;
+	}
+	// --- ASHFRAME CUSTOM (client version gate) ---
 	// --- ASHFRAME CUSTOM (capability handshake) ---
 	// --- ASHFRAME CUSTOM (MTU probing, upstream PR #3633 port) ---
 	/// Argon client version that supports MTU probe traffic (channel 7).
@@ -734,6 +786,13 @@ pub const User = struct { // MARK: User
 				}
 			}
 		}
+		// --- ASHFRAME CUSTOM (Discord account recovery): a key that redeemed a
+		// recovery code takes over the linked account's player index; loadPlayer
+		// then rebinds the index to this key (players.rebindKey). ---
+		if (main.server.discordlink.recoveryIndexFor(self.newKeyString.?)) |oldIndex| {
+			self.playerIndex = oldIndex;
+		}
+		// --- ASHFRAME CUSTOM (Discord account recovery) ---
 		if (!allowedToJoin) {
 			std.log.info("Rejected connection from '{s}' ({s})", .{name, self.newKeyString.?});
 			return error.NotWhitelisted;
@@ -803,6 +862,11 @@ pub const User = struct { // MARK: User
 			}
 		}
 		// --- ASHFRAME CUSTOM (Server owner bootstrap) ---
+		// --- ASHFRAME CUSTOM (Discord account link): the relay bot answers
+		// Discord DMs through /relay; relay.zig re-checks the key. ---
+		if (main.server.chatfilter.isProtected(self.newKeyString)) {
+			main.entity.components.@"cubyz:permissions".server.addPermission(self.id, .white, "/command/relay");
+		}
 
 		if (self.isLocal) {
 			main.entity.components.@"cubyz:permissions".server.addToGroup(self.id, permission.Group.moderator);
@@ -1022,6 +1086,12 @@ pub const User = struct { // MARK: User
 			};
 		}
 
+		// --- ASHFRAME CUSTOM (Anticheat v2) ---
+		// After this player's block changes ran, so digging down / walking into
+		// a freshly mined tunnel isn't mistaken for noclip.
+		main.server.anticheat.checkNoclipTick(self);
+		// --- ASHFRAME CUSTOM (Anticheat v2) ---
+
 		self.mutex.lock();
 		defer self.mutex.unlock();
 		var time = @as(i16, @truncate(main.timestamp().toMilliseconds())) -% main.settings.entityLookback;
@@ -1049,8 +1119,6 @@ pub const User = struct { // MARK: User
 	}
 
 	pub fn receiveData(self: *User, reader: *BinaryReader) !void {
-		self.mutex.lock();
-		defer self.mutex.unlock();
 		const position: [3]f64 = try reader.readVec(Vec3d);
 		const velocity: [3]f64 = try reader.readVec(Vec3d);
 		const rotation: [3]f32 = try reader.readVec(Vec3f);
@@ -1060,9 +1128,15 @@ pub const User = struct { // MARK: User
 			main.server.report.recordKick(self.name, "malformed position");
 			return error.Invalid;
 		}
-		// Wave 1 logs implausible speed; wave 2 drops the update (keeping the
-		// last valid position) rather than disconnecting.
-		if (!main.server.anticheat.checkMovement(self, position, velocity)) return;
+		// --- ASHFRAME CUSTOM (Anticheat v2) ---
+		// Terrain lookups take chunk locks, so do them before taking our mutex.
+		const probe = main.server.anticheat.probeWorld(position);
+		// --- ASHFRAME CUSTOM (Anticheat v2) ---
+		self.mutex.lock();
+		defer self.mutex.unlock();
+		// Positions failing validation are dropped and the player is set back
+		// to their last valid position (anticheat.validateMovement).
+		if (!main.server.anticheat.checkMovement(self, position, velocity, probe)) return;
 		self.player().rot = rotation;
 		const time = try reader.readInt(i16);
 		self.timeDifference.addDataPoint(time);
@@ -1390,15 +1464,20 @@ pub fn stop(typ: StopType) void {
 }
 
 pub fn disconnect(user: *User) void { // MARK: disconnect()
-	if (!user.connected.load(.monotonic)) return;
+	// --- ASHFRAME CUSTOM (disconnect race): clear `connected` first and
+	// atomically. The old load-then-store let two threads (network timeout
+	// and the server's own teardown) both queue the user for deinit, and a
+	// join still queued in userConnectList could add an already-disconnected
+	// user to `users` after this ran, so it was freed while still listed
+	// (crash: use-after-free in update()/ResortTaskTask). connectInternal
+	// re-checks the flag under userMutex before listing the user. ---
+	if (!user.connected.swap(false, .acq_rel)) return;
 	removePlayer(user);
 	userDeinitList.pushBack(user);
-	user.connected.store(false, .monotonic);
 }
 
+/// Only called from disconnect(), which has already cleared `connected`.
 pub fn removePlayer(user: *User) void { // MARK: removePlayer()
-	if (!user.connected.load(.monotonic)) return;
-
 	const foundUser = blk: {
 		userMutex.lock();
 		defer userMutex.unlock();
@@ -1446,6 +1525,10 @@ pub fn connect(user: *User) void {
 }
 
 pub fn connectInternal(user: *User) void {
+	// --- ASHFRAME CUSTOM (disconnect race): the connection can drop while the
+	// join waits in userConnectList; the user is then already queued for
+	// deinit and must not be set up or listed. ---
+	if (!user.connected.load(.acquire)) return;
 	// --- ASHFRAME CUSTOM (Ban check) ---
 	// NB: do NOT send chat here. The handshake is not complete yet, and sending a
 	// chat message pre-handshake crashed `Connection.send`. The client just sees
@@ -1473,6 +1556,12 @@ pub fn connectInternal(user: *User) void {
 	// near field first at every render distance.
 	user.beginTeleportViewRamp();
 	// --- ASHFRAME CUSTOM (Dynamic render distance) ---
+	// --- ASHFRAME CUSTOM (Anticheat v2) ---
+	// The join spawn isn't a sendTPCoordinates teleport; give the same grace
+	// so the first positions (terrain still loading) aren't judged. The client
+	// starts exactly at the saved position, which becomes the arrival point.
+	main.server.anticheat.expectTeleportTo(user, user.player().pos);
+	// --- ASHFRAME CUSTOM (Anticheat v2) ---
 	// Cache staff status on the server thread: the movement check runs on the
 	// network thread, where `hasPermission` may not be called.
 	user.anticheatStaff = main.entity.components.@"cubyz:permissions".server.hasPermission(user.id, report.permissionPath);
@@ -1484,6 +1573,11 @@ pub fn connectInternal(user: *User) void {
 	// joining clients don't render noon until the 2 s tick. MUST be after
 	// .complete or Connection.send drops it (protocol 9). Stock packet. ---
 	main.network.protocols.genericUpdate.sendTime(user.conn, world.?);
+	// Restore where the player was looking. The saved rotation reaches the
+	// client's entity, but its camera keeps its own (reset) rotation unless the
+	// server sets it, so after a restart cameras (CCTV) faced the wrong way.
+	// Same stock sync op `/tp` uses, so vanilla clients apply it too.
+	main.sync.server.sendSyncOperation(.{.rotation = .{.target = user, .rotation = user.player().rot}}, user);
 	// --- ASHFRAME CUSTOM (join-time sync) ---
 
 	// TODO: addEntity(player);
@@ -1498,6 +1592,11 @@ pub fn connectInternal(user: *User) void {
 			}
 		}
 	}
+	// --- ASHFRAME CUSTOM (Discord account recovery): finish a pending recovery
+	// now that the old index is loaded under this key and no other session
+	// holds it. ---
+	main.server.discordlink.finishRecovery(user);
+	// --- ASHFRAME CUSTOM (Discord account recovery) ---
 	// Let the other clients know about this new one.
 	{
 		const zonArray = main.ZonElement.initArray(main.stackAllocator);
@@ -1531,7 +1630,13 @@ pub fn connectInternal(user: *User) void {
 	// every live drop — mark them seen so the catch-up sweep never re-sends
 	// them as duplicate adds (unguarded clients crash on duplicates). ---
 	world.?.itemDropManager.markAllSeenBy(user);
-	sendMessage("{s}§#8a8a8a joined", .{user.name});
+	// --- ASHFRAME CUSTOM (join client tag): "X joined on Argon v2" / "on Vanilla".
+	// The Discord relay's join pattern accepts the optional " on ..." suffix. ---
+	if (user.isArgon()) {
+		sendMessage("{s}§#8a8a8a joined on Argon v{d}", .{user.name, user.ashframeClientVersion.?});
+	} else {
+		sendMessage("{s}§#8a8a8a joined on Vanilla", .{user.name});
+	}
 	// --- ASHFRAME CUSTOM (Shop status report) ---
 	main.server.shops.reportOnJoin(user);
 	// --- ASHFRAME CUSTOM (Shop status report) ---
@@ -1541,6 +1646,13 @@ pub fn connectInternal(user: *User) void {
 	// --- ASHFRAME CUSTOM (Server report) ---
 
 	userMutex.lock();
+	// --- ASHFRAME CUSTOM (disconnect race): disconnect() clears `connected`
+	// before taking userMutex to remove the user, so either it sees the user
+	// listed and removes it, or we see the flag here and never list it. ---
+	if (!user.connected.load(.acquire)) {
+		userMutex.unlock();
+		return;
+	}
 	users.append(user);
 	userMutex.unlock();
 
@@ -1614,7 +1726,9 @@ pub fn messageFrom(msg: []const u8, source: *User) void { // MARK: message
 	const clean_msg = emojis.parseEmojis(msg, &emoji_buf);
 
 	// --- ASHFRAME CUSTOM (Chat filter) ---
-	if (chatfilter.findBad(clean_msg) != null) {
+	if (chatfilter.findBad(clean_msg)) |term| {
+		// Logged so a wrongful strike can be traced (blocked lines never reach chat).
+		std.log.info("[ashframe] chat filter blocked a message from {s} (matched \"{s}\"): {s}", .{source.name, term, clean_msg});
 		// The ban (message + save + disconnect) is completed on the server thread.
 		_ = chatfilter.strike(source);
 		return;

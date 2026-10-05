@@ -44,7 +44,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 // IP_DONTFRAGMENT lives in ws2ipdef.h, which ws2tcpip.h pulls in. Without
-// this the MTU-probing DF setsockopt (network.zig setDontFragment) fails
+// this the MTU-probing DF setsockopt (network.zig sendProbe) fails
 // to compile on Windows.
 #include <ws2tcpip.h>
 #endif

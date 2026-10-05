@@ -851,3 +851,27 @@ pub fn drawNearby(user: *User, radius: i32) void {
 	}
 }
 // --- ASHFRAME CUSTOM (Land claims) ---
+
+// --- ASHFRAME CUSTOM (Discord account recovery) ---
+/// Moves claim ownership/membership from `oldKey` to `newKey` (the player index
+/// stays the same). Server thread. Returns how many entries changed.
+pub fn rekey(oldKey: []const u8, newKey: []const u8) usize {
+	ensure();
+	var n: usize = 0;
+	for (claims.items) |*c| {
+		if (c.ownerKey.len != 0 and std.mem.eql(u8, c.ownerKey, oldKey)) {
+			main.globalAllocator.free(c.ownerKey);
+			c.ownerKey = main.globalAllocator.dupe(u8, newKey);
+			n += 1;
+		}
+		for (c.memberKeys[0..c.memberCount]) |*k| {
+			if (k.len != 0 and std.mem.eql(u8, k.*, oldKey)) {
+				main.globalAllocator.free(k.*);
+				k.* = main.globalAllocator.dupe(u8, newKey);
+				n += 1;
+			}
+		}
+	}
+	return n;
+}
+// --- ASHFRAME CUSTOM (Discord account recovery) ---

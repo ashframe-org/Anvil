@@ -222,6 +222,14 @@ pub const handShake = struct { // MARK: handShake
 					if (main.server.world.?.mode != .singleplayer) {
 						const keys = zon.getChild("keys");
 						try conn.user.?.identifyFromKeysAndName(name, keys, main.server.world.?.settings.whitelistEnabled.load(.monotonic));
+						// --- ASHFRAME CUSTOM (client version gate): Argon or vanilla
+						// 0.4.1 only. Checked after identify so the relay bot's key is
+						// known; a forged key still fails the signature check. ---
+						if (!conn.user.?.isAllowedClient(version)) {
+							std.log.info("[ashframe] refused {s}: client version {s} is not allowed (Argon or 0.4.1 only)", .{name, version});
+							return error.IncompatibleVersion;
+						}
+						// --- ASHFRAME CUSTOM (client version gate) ---
 
 						var writer: utils.BinaryWriter = .init(main.stackAllocator);
 						defer writer.deinit();
@@ -922,7 +930,11 @@ pub const genericUpdate = struct { // MARK: genericUpdate
 	pub fn sendTPCoordinates(conn: *Connection, pos: Vec3d) void {
 		// --- ASHFRAME CUSTOM (Teleport view ramp): every teleport goes through
 		// here, so this is the one place we need to hook. ---
-		if (conn.user) |user| user.beginTeleportViewRamp();
+		if (conn.user) |user| {
+			user.beginTeleportViewRamp();
+			// Anticheat: positions until the client gets here are stale.
+			main.server.anticheat.expectTeleportTo(user, pos);
+		}
 		// --- ASHFRAME CUSTOM (Teleport view ramp) ---
 		var writer = utils.BinaryWriter.initCapacity(main.stackAllocator, 25);
 		defer writer.deinit();
@@ -1016,6 +1028,17 @@ pub const chat = struct { // MARK: chat
 			main.server.anticheat.note(user, .rate, "chat");
 			return;
 		}
+		// --- ASHFRAME CUSTOM (Discord account link): the relay bot's client
+		// library can only send chat, so its "/relay ..." lines are run as the
+		// command the game client would have sent. Never broadcast: they carry
+		// link codes and Discord ids. ---
+		if (std.mem.startsWith(u8, msg, "/relay ")) {
+			if (main.server.chatfilter.isProtected(user.newKeyString)) {
+				main.sync.server.queueChatCommand(user, msg[1..]);
+			}
+			return;
+		}
+		// --- ASHFRAME CUSTOM (Discord account link) ---
 		main.server.messageFrom(msg, user);
 	}
 

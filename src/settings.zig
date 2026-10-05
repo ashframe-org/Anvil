@@ -256,6 +256,18 @@ pub const launchConfig = struct {
 	/// see the probe channel. Kill-switch: false disables all probing.
 	pub var mtuProbing: bool = true;
 	// --- ASHFRAME CUSTOM (MTU probing) ---
+	// --- ASHFRAME CUSTOM (Anticheat v2 modes) ---
+	/// off = check disabled; log = run it and log what it would have done
+	/// ("[suspect] ... (log only)"), but never block, set back or kick;
+	/// enforce = act on it (setbacks, rejected breaks/interactions, kicks).
+	pub const AnticheatMode = enum { off, log, enforce };
+	/// Speed, flight and noclip (server-authoritative movement).
+	pub var anticheatMovement: AnticheatMode = .log;
+	/// Break-speed budget (fast mine, nuker, instant break).
+	pub var anticheatMining: AnticheatMode = .log;
+	/// Block interaction distance.
+	pub var anticheatReach: AnticheatMode = .log;
+	// --- ASHFRAME CUSTOM (Anticheat v2 modes) ---
 	// --- ASHFRAME CUSTOM (Hunger) ---
 	/// Hunger uses the vanilla energy bar (energy == calories). Drains over
 	/// time, food (`/eat`) restores it, and starving drains health to 1 HP.
@@ -290,6 +302,9 @@ pub const launchConfig = struct {
 		// --- ASHFRAME CUSTOM (UX-6: asset pack skip) ---
 		ashframePackSkip = zon.get(bool, "ashframePackSkip") orelse ashframePackSkip;
 		mtuProbing = zon.get(bool, "mtuProbing") orelse mtuProbing;
+		anticheatMovement = zon.get(AnticheatMode, "anticheatMovement") orelse anticheatMovement;
+		anticheatMining = zon.get(AnticheatMode, "anticheatMining") orelse anticheatMining;
+		anticheatReach = zon.get(AnticheatMode, "anticheatReach") orelse anticheatReach;
 		// --- ASHFRAME CUSTOM (UX-6) ---
 		hungerSystem = zon.get(bool, "hungerSystem") orelse hungerSystem;
 		// --- ASHFRAME CUSTOM (UX-3: tunable worker count) ---

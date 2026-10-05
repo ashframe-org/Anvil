@@ -72,5 +72,6 @@ Sensitive actions additionally gate behind `/ashframe/admin/*` (never granted by
 
 - Chat/signs/names filtered (3 strikes = ban). Mild profanity allowed.
 - Anticheat logs to `saves/<world>/ashframe_anticheat.zig.zon`. Test suite: `tools/run_anticheat_tests.sh`.
+- Anticheat v2 (movement/mining/reach) modes in `launchConfig.zon`: `.anticheatMovement`, `.anticheatMining`, `.anticheatReach` = `.off` / `.log` (default, never acts) / `.enforce`.
 - Metrics snapshot: `saves/<world>/ashframe_metrics.json`. Dashboard: `tools/ashframe_monitor.py`.
 - Networking is vanilla-compatible: interest-gated broadcasts (same packets, fewer recipients), block updates batched per tick per player, asset-pack skip, slow-channel chunks/lightmaps, and MTU path discovery (RFC 8899) for capable Argon clients.

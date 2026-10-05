@@ -1109,3 +1109,20 @@ test "shop trade summary direction" {
 }
 
 // --- ASHFRAME CUSTOM (Sign shops) ---
+
+// --- ASHFRAME CUSTOM (Discord account recovery) ---
+/// Moves shop ownership from `oldKey` to `newKey`. Server thread. Returns how
+/// many shops changed.
+pub fn rekey(oldKey: []const u8, newKey: []const u8) usize {
+	ensure();
+	var n: usize = 0;
+	for (shops.items) |*s| {
+		if (std.mem.eql(u8, s.owner, oldKey)) {
+			main.globalAllocator.free(s.owner);
+			s.owner = main.globalAllocator.dupe(u8, newKey);
+			n += 1;
+		}
+	}
+	return n;
+}
+// --- ASHFRAME CUSTOM (Discord account recovery) ---

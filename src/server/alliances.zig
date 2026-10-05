@@ -547,3 +547,27 @@ pub fn autosave(worldPath: []const u8) void {
 	}
 }
 // --- ASHFRAME CUSTOM (Alliances) ---
+
+// --- ASHFRAME CUSTOM (Discord account recovery) ---
+fn rekeyString(s: *[]const u8, oldKey: []const u8, newKey: []const u8) usize {
+	if (s.len == 0 or !std.mem.eql(u8, s.*, oldKey)) return 0;
+	main.globalAllocator.free(s.*);
+	s.* = main.globalAllocator.dupe(u8, newKey);
+	return 1;
+}
+
+/// Moves alliance leadership, membership and pending requests/invites from
+/// `oldKey` to `newKey` (the player index stays the same). Server thread.
+/// Returns how many entries changed.
+pub fn rekey(oldKey: []const u8, newKey: []const u8) usize {
+	ensure();
+	var n: usize = 0;
+	for (alliances.items) |*a| {
+		n += rekeyString(&a.ownerKey, oldKey, newKey);
+		for (a.members[0..a.memberCount]) |*m| n += rekeyString(&m.key, oldKey, newKey);
+	}
+	for (requests.items) |*r| n += rekeyString(&r.key, oldKey, newKey);
+	for (invites.items) |*r| n += rekeyString(&r.key, oldKey, newKey);
+	return n;
+}
+// --- ASHFRAME CUSTOM (Discord account recovery) ---
